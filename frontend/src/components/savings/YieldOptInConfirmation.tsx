@@ -5,6 +5,8 @@ import FeeDisclosure, { type FeeDisclosureProps } from "./FeeDisclosure";
 export interface YieldOptInConfirmationProps {
   /** APR percentage offered */
   apr: number;
+  /** Amount being deposited */
+  amount: string;
   /** Fee disclosure props (contains performanceFeeBps) */
   feeDisclosure: FeeDisclosureProps;
   /** Callback when user confirms opt-in */
@@ -17,6 +19,7 @@ export interface YieldOptInConfirmationProps {
 
 export default function YieldOptInConfirmation({
   apr,
+  amount,
   feeDisclosure,
   onConfirm,
   onCancel,
@@ -40,6 +43,16 @@ export default function YieldOptInConfirmation({
       </header>
 
       <section className="space-y-4 border-t border-border pt-4">
+        <div className="rounded-lg bg-brand/5 p-3">
+          <p className="text-sm text-muted">Amount to deposit</p>
+          <p
+            className="mt-1 text-2xl font-bold text-foreground"
+            aria-label={`${amount} USDC`}
+          >
+            {amount} USDC
+          </p>
+        </div>
+
         <div className="rounded-lg bg-brand/5 p-3">
           <p className="text-sm text-muted">Annual Percentage Rate</p>
           <p

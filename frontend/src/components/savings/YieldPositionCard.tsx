@@ -25,6 +25,8 @@ export interface YieldPositionCardProps {
   position: YieldPosition | null;
   assetCode?: string;
   className?: string;
+  /** Callback when user clicks the call-to-action in empty state */
+  onOptIn?: () => void;
 }
 
 /**
@@ -35,6 +37,7 @@ export default function YieldPositionCard({
   position,
   assetCode = "USDC",
   className = "",
+  onOptIn,
 }: YieldPositionCardProps) {
   const hasPosition = position !== null && BigInt(position.shares || "0") > BigInt(0);
 
@@ -48,6 +51,15 @@ export default function YieldPositionCard({
         <p data-testid="yield-position-empty" className="mt-1 text-sm text-muted">
           You don&apos;t have a yield position yet.
         </p>
+        {onOptIn && (
+          <button
+            onClick={onOptIn}
+            className="mt-4 w-full rounded-xl bg-brand px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-brand/90"
+            data-testid="yield-position-cta"
+          >
+            Enable Yield
+          </button>
+        )}
       </div>
     );
   }

@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 import YieldPositionCard, { type YieldPosition } from "./YieldPositionCard";
 
 const position: YieldPosition = {
@@ -52,5 +53,31 @@ describe("YieldPositionCard", () => {
       />,
     );
     expect(screen.getByTestId("yield-position-empty")).toBeInTheDocument();
+  });
+
+  it("shows CTA button in empty state when onOptIn is provided", () => {
+    const onOptIn = vi.fn();
+    render(<YieldPositionCard position={null} onOptIn={onOptIn} />);
+    expect(screen.getByTestId("yield-position-cta")).toBeInTheDocument();
+    expect(screen.getByText("Enable Yield")).toBeInTheDocument();
+  });
+
+  it("calls onOptIn when CTA button is clicked", () => {
+    const onOptIn = vi.fn();
+    render(<YieldPositionCard position={null} onOptIn={onOptIn} />);
+    const ctaButton = screen.getByTestId("yield-position-cta");
+    fireEvent.click(ctaButton);
+    expect(onOptIn).toHaveBeenCalled();
+  });
+
+  it("does not show CTA button when onOptIn is not provided", () => {
+    render(<YieldPositionCard position={null} />);
+    expect(screen.queryByTestId("yield-position-cta")).not.toBeInTheDocument();
+  });
+
+  it("does not show CTA button when position exists", () => {
+    const onOptIn = vi.fn();
+    render(<YieldPositionCard position={position} onOptIn={onOptIn} />);
+    expect(screen.queryByTestId("yield-position-cta")).not.toBeInTheDocument();
   });
 });
