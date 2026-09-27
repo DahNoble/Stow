@@ -8,55 +8,21 @@
 //!
 //! Tests that exercise a strategy (`harvest`, `migrate_strategy`, ...) will
 //! additionally need a minimal mock strategy contract implementing the
-//! interface documented in `README.md` under "Strategy interface"; building
-//! that mock is issue-worthy on its own (see the module doc below) and does
-//! not exist yet, so those tests cannot be un-ignored until it does.
+//! interface documented in `README.md` under "Strategy interface" — use
+//! `crate::mock_strategy::MockStrategy` (via `setup_mock_strategy`).
 
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, testutils::Events as _, Address, Env, IntoVal,
-    Symbol,
+    testutils::Address as _, testutils::Events as _, Address, Env, IntoVal, Symbol,
 };
 
 use crate::error::Error;
 use crate::{YieldAdapter, YieldAdapterClient};
 
 // ---------------------------------------------------------------------------
-// Mock strategy — a minimal real contract implementing the "Strategy
-// interface" documented in README.md (`deposit`, `withdraw`, `balance`), so
-// #245/#246's event-publisher tests can exercise register/activate/migrate
-// and harvest/fee flows end to end. A fuller-featured mock (configurable
-// simulated yield curves, failure injection, etc.) is tracked separately as
-// issue #251; this is deliberately the minimum needed to make THIS PR's own
-// new tests real.
-#[contract]
-pub struct MockStrategy;
-
-#[contractimpl]
-impl MockStrategy {
-    pub fn deposit(env: Env, from: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), from);
-        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-        env.storage().instance().set(&key, &(current + amount));
-    }
-
-    pub fn withdraw(env: Env, to: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), to);
-        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-        env.storage().instance().set(&key, &(current - amount));
-    }
-
-    pub fn balance(env: Env, of: Address) -> i128 {
-        let key = (Symbol::new(&env, "bal"), of);
-        env.storage().instance().get(&key).unwrap_or(0)
-    }
-
-    /// Test-only: simulate yield/loss by directly setting the reported
-    /// balance, independent of actual deposit/withdraw calls.
-    pub fn set_reported_balance(env: Env, of: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), of);
-        env.storage().instance().set(&key, &amount);
-    }
-}
+// Mock strategy — see `crate::mock_strategy` for the full interface and test
+// knobs (simulated yield/loss, failure injection, withdrawal haircut,
+// token-backed mode).
+use crate::mock_strategy::{MockStrategy, MockStrategyClient};
 
 fn setup_mock_strategy(env: &Env) -> Address {
     env.register(MockStrategy, ())
@@ -119,14 +85,23 @@ fn admin_treasury_token_error_before_initialize() {
 }
 
 #[test]
-#[ignore = "TODO(issue): implement deposit::deposit + accounting::convert_to_shares"]
 fn deposit_mints_shares_proportional_to_exchange_rate() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _treasury, _token) = setup_with_token(&env);
-    let _user = Address::generate(&env);
-    // On the very first deposit, shares must be minted 1:1 with assets.
-    todo!("deposit `amount`, assert `get_position(user).shares == amount`");
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&user, &1_000);
+
+    // First deposit: shares minted 1:1 with assets.
+    let shares = client.deposit(&user, &1_000);
+    assert_eq!(shares, 1_000, "first deposit must mint shares 1:1");
+
+    let position = client.get_position(&user);
+    assert_eq!(position.shares, 1_000);
+    assert_eq!(position.owner, user);
+    assert_eq!(client.total_shares(), 1_000);
 }
 
 #[test]
@@ -142,9 +117,82 @@ fn claim_before_cooldown_elapsed_rejected() {
 }
 
 #[test]
-#[ignore = "TODO(issue): implement withdraw::cancel_withdraw"]
 fn cancel_withdraw_returns_shares_to_owner() {
-    todo!("request_withdraw, cancel_withdraw, assert position shares restored");
+    use crate::types::{DataKey, Position, WithdrawRequest};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let request_id = 1u64;
+    let now = env.ledger().timestamp();
+
+    // `request_withdraw` is a separate, still-unimplemented issue (see
+    // `withdraw_round_trip_returns_correct_assets`), so seed the state it
+    // would have left behind directly: an owner position already debited by
+    // the 400 shares burned at request time, a matching `WithdrawRequest`
+    // whose `shares` field holds the asset amount fixed at that moment (per
+    // `request_withdraw`'s doc comment), and a vault-wide `TotalShares` net
+    // of that burn.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &600i128);
+        env.storage().persistent().set(
+            &DataKey::Position(owner.clone()),
+            &Position {
+                owner: owner.clone(),
+                shares: 600,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::WithdrawRequest(request_id),
+            &WithdrawRequest {
+                id: request_id,
+                owner: owner.clone(),
+                shares: 400,
+                claimable_at: now,
+                requested_at: now,
+                claimed_at: None,
+                cancelled_at: None,
+            },
+        );
+    });
+
+    // The vault holds 600 idle tokens against the 600 shares seeded above —
+    // a 1:1 exchange rate — so re-minting the request's fixed 400-asset
+    // amount should hand back exactly 400 shares.
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client.address, &600);
+
+    client.cancel_withdraw(&owner, &request_id);
+
+    let position: Position = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Position(owner.clone()))
+            .unwrap()
+    });
+    assert_eq!(
+        position.shares, 1000,
+        "the 400 re-minted shares must be added back to the owner's existing 600"
+    );
+    assert_eq!(client.total_shares(), 1000);
+
+    let request: WithdrawRequest = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WithdrawRequest(request_id))
+            .unwrap()
+    });
+    assert!(request.cancelled_at.is_some());
+
+    // The request is now resolved — cancelling it again (standing in for a
+    // later claim attempt, since `claim_withdraw` checks the same flag) must
+    // reject rather than re-mint a second time.
+    let result = client.try_cancel_withdraw(&owner, &request_id);
+    assert_eq!(result, Err(Ok(Error::WithdrawAlreadyResolved)));
 }
 
 #[test]
@@ -900,9 +948,9 @@ fn total_shares_returns_zero_before_initialize() {
     use crate::accounting::total_shares;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Before initialization, total_shares should return 0
-    let shares = total_shares(&env);
+    let shares = env.as_contract(&client.address, || total_shares(&env));
     assert_eq!(shares, 0, "total_shares should be 0 before any deposits");
 }
 
@@ -911,9 +959,9 @@ fn total_assets_returns_zero_before_initialize() {
     use crate::accounting::total_assets;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Before initialization (no token set), total_assets should return 0
-    let assets = total_assets(&env);
+    let assets = env.as_contract(&client.address, || total_assets(&env));
     assert_eq!(assets, 0, "total_assets should be 0 before initialization");
 }
 
@@ -940,13 +988,15 @@ fn total_shares_reflects_running_total() {
     use crate::types::DataKey;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Manually set TotalShares to test the read
-    env.storage()
-        .instance()
-        .set(&DataKey::TotalShares, &1000i128);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &1000i128);
+    });
 
-    let shares = total_shares(&env);
+    let shares = env.as_contract(&client.address, || total_shares(&env));
     assert_eq!(shares, 1000, "total_shares should reflect stored value");
 }
 

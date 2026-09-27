@@ -41,6 +41,8 @@ mod types;
 mod withdraw;
 
 #[cfg(test)]
+mod mock_strategy;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};

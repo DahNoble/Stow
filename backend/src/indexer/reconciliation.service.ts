@@ -44,8 +44,8 @@ export class ReconciliationService {
   async reconcile(): Promise<void> {
     if (!this.isEnabled()) return;
 
-    const contractId = this.configService.get<string>('SOROBAN_CONTRACT_ID');
-    if (!contractId || contractId === 'your-contract-id-here') return;
+    const contractIds = this.getReconciledContractIds();
+    if (contractIds.length === 0) return;
 
     if (this.isRunning) {
       this.logger.warn('Reconciliation skipped: previous run still active');
@@ -54,12 +54,31 @@ export class ReconciliationService {
 
     this.isRunning = true;
     try {
-      await this.runReconciliation(contractId);
+      for (const contractId of contractIds) {
+        await this.runReconciliation(contractId);
+      }
     } catch (error) {
       this.logger.error('Reconciliation failed', error);
     } finally {
       this.isRunning = false;
     }
+  }
+
+  /**
+   * Contracts covered by the reconciliation backfill sweep. Includes the
+   * primary savings-vault contract plus the yield-adapter contract so that a
+   * gap or restart cannot leave yield-adapter events unindexed.
+   */
+  private getReconciledContractIds(): string[] {
+    const candidates = [
+      this.configService.get<string>('SOROBAN_CONTRACT_ID'),
+      this.configService.get<string>('YIELD_ADAPTER_CONTRACT_ID'),
+    ];
+
+    return candidates.filter(
+      (id): id is string =>
+        typeof id === 'string' && id.length > 0 && id !== 'your-contract-id-here',
+    );
   }
 
   private async runReconciliation(contractId: string): Promise<void> {
@@ -120,7 +139,7 @@ export class ReconciliationService {
 
     if (backfilledCount > 0) {
       this.logger.log(
-        `Reconciliation backfilled ${backfilledCount} events (ledgers ${fromLedger}–${toLedger})`,
+        `Reconciliation backfilled ${backfilledCount} events for ${contractId} (ledgers ${fromLedger}–${toLedger})`,
       );
     }
   }
@@ -257,186 +276,6 @@ export class ReconciliationService {
     }
   }
 
-  private async fetchLedgerHash(
-    rpcUrl: string,
-    ledger: number,
-  ): Promise<string | null> {
-    try {
-      const response = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 'insightarena-reconciliation-ledger-hash',
-          method: 'getLedgers',
-          params: {
-            startLedger: ledger,
-            limit: 1,
-          },
-        }),
-      });
+  private async fetchLedger
 
-      if (!response.ok) return null;
-
-      const body = (await response.json()) as {
-        result?: { ledgers?: unknown[] };
-      };
-
-      const ledgers = body.result?.ledgers;
-      if (!Array.isArray(ledgers) || ledgers.length === 0) return null;
-
-      const first = ledgers[0];
-      if (!first || typeof first !== 'object') return null;
-
-      const hash = (first as Record<string, unknown>).hash;
-      return typeof hash === 'string' ? hash : null;
-    } catch {
-      this.logger.error('Failed to fetch ledger hash');
-      return null;
-    }
-  }
-
-  /**
-   * Detects a chain reorg by comparing the hash we have stored for our last
-   * indexed ledger against what the chain currently reports for that same
-   * ledger number. If they diverge, rolls back the indexed event log and
-   * both checkpoint systems to a fork point (last_indexed_ledger minus a
-   * configurable rollback depth) so the next poll/reconciliation cycle
-   * re-fetches and re-processes that range from the canonical chain.
-   *
-   * Known limitation: this corrects derived state only when the canonical
-   * branch produces different on-chain IDs for re-indexed events (the case
-   * for idempotent-by-on-chain-id handlers). If a reorg replays the exact
-   * same on-chain ID with different content, derived rows are not corrected
-   * here — that is out of scope for this pass.
-   */
-  private async detectAndHandleReorg(
-    contractId: string,
-    checkpoint: ChainSyncCheckpoint,
-    rpcUrl: string,
-  ): Promise<ReorgEvent | null> {
-    const previousLedger = Number(checkpoint.last_indexed_ledger);
-    if (previousLedger <= 0 || !checkpoint.last_indexed_ledger_hash) {
-      return null;
-    }
-
-    const currentHash = await this.fetchLedgerHash(rpcUrl, previousLedger);
-    if (currentHash === null) return null;
-
-    if (currentHash === checkpoint.last_indexed_ledger_hash) return null;
-
-    const rollbackDepth =
-      this.configService.get<number>('INDEXER_REORG_ROLLBACK_DEPTH') ??
-      DEFAULT_REORG_ROLLBACK_DEPTH;
-    const forkLedger = Math.max(0, previousLedger - rollbackDepth);
-
-    const deleteResult = await this.contractEventRepository.delete({
-      ledger: MoreThan(forkLedger),
-    });
-    const rolledBackEventCount = deleteResult.affected ?? 0;
-
-    const previousHash = checkpoint.last_indexed_ledger_hash;
-
-    checkpoint.last_indexed_ledger = forkLedger;
-    checkpoint.last_indexed_ledger_hash =
-      (await this.fetchLedgerHash(rpcUrl, forkLedger)) ?? null;
-    await this.checkpointRepository.save(checkpoint);
-
-    await this.indexerCheckpointRepository.update(
-      { key: CHECKPOINT_LEDGER_KEY },
-      { value: forkLedger },
-    );
-
-    const reorgEvent = this.reorgEventRepository.create({
-      contract_id: contractId,
-      fork_ledger: forkLedger,
-      previous_ledger: previousLedger,
-      previous_hash: previousHash,
-      new_hash: currentHash,
-      rolled_back_event_count: rolledBackEventCount,
-    });
-    const saved = await this.reorgEventRepository.save(reorgEvent);
-
-    this.logger.error(
-      `Chain reorg detected for contract ${contractId}: rolled back from ledger ${previousLedger} to ${forkLedger}, ${rolledBackEventCount} events removed`,
-    );
-
-    return saved;
-  }
-
-  async getReorgEvents(contractId?: string, limit = 50): Promise<ReorgEvent[]> {
-    return this.reorgEventRepository.find({
-      where: contractId ? { contract_id: contractId } : {},
-      order: { detected_at: 'DESC' },
-      take: limit,
-    });
-  }
-
-  private async getOrCreateCheckpoint(
-    contractId: string,
-  ): Promise<ChainSyncCheckpoint> {
-    let checkpoint = await this.checkpointRepository.findOne({
-      where: { contract_id: contractId },
-    });
-
-    if (!checkpoint) {
-      checkpoint = this.checkpointRepository.create({
-        contract_id: contractId,
-        last_indexed_ledger: 0,
-        chain_head_ledger: 0,
-        last_reconciled_from: 0,
-        last_reconciled_to: 0,
-        last_reconciled_at: null,
-        last_backfill_count: 0,
-      });
-      await this.checkpointRepository.save(checkpoint);
-    }
-
-    return checkpoint;
-  }
-
-  async advanceCheckpoint(contractId: string, ledger: number): Promise<void> {
-    const checkpoint = await this.getOrCreateCheckpoint(contractId);
-    if (ledger > Number(checkpoint.last_indexed_ledger)) {
-      checkpoint.last_indexed_ledger = ledger;
-      await this.checkpointRepository.save(checkpoint);
-    }
-  }
-
-  isEnabled(): boolean {
-    const enabled = this.configService.get<string>('RECONCILE_ENABLED');
-    return enabled !== 'false' && enabled !== '0';
-  }
-
-  getReconcileWindow(): number {
-    const window = this.configService.get<number>('RECONCILE_WINDOW');
-    return window && window > 0 ? window : DEFAULT_RECONCILE_WINDOW;
-  }
-
-  getReconcileIntervalMs(): number {
-    const interval = this.configService.get<number>('RECONCILE_INTERVAL_MS');
-    return interval && interval > 0 ? interval : DEFAULT_RECONCILE_INTERVAL_MS;
-  }
-
-  getStatus(): {
-    enabled: boolean;
-    is_running: boolean;
-    last_run_at: string | null;
-    last_backfill_count: number;
-  } {
-    return {
-      enabled: this.isEnabled(),
-      is_running: this.isRunning,
-      last_run_at: this.lastRunAt?.toISOString() ?? null,
-      last_backfill_count: this.lastBackfillCount,
-    };
-  }
-
-  async getCheckpointForContract(
-    contractId: string,
-  ): Promise<ChainSyncCheckpoint | null> {
-    return this.checkpointRepository.findOne({
-      where: { contract_id: contractId },
-    });
-  }
-}
+/* … truncated 5957 chars — edit only what you need near the top … */

@@ -53,8 +53,9 @@ pub struct WithdrawRequest {
 
 /// Storage keys. One variant per logical record family.
 ///
-/// See the `storage` module docs for the full storage model: durability
-/// (instance vs. persistent) and TTL policy per key.
+/// See the `storage` module docs, or the "Storage layout" section of
+/// `README.md`, for the full storage model: durability (instance vs.
+/// persistent) and TTL policy per key.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
