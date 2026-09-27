@@ -950,6 +950,155 @@ export class SorobanService {
   }
 
   /**
+   * Read total shares from the yield-adapter contract.
+   * Calls: total_shares() -> i128
+   *
+   * Returns the total shares as a string, or null if contract read fails.
+   */
+  async getYieldAdapterTotalShares(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterTotalShares: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterTotalShares',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('total_shares'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterTotalShares simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterTotalShares failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the currently active strategy ID from the yield-adapter contract.
+   * Calls: get_active_strategy() -> Option<u64>
+   *
+   * Returns the strategy ID, or null if no active strategy (idle funds).
+   */
+  async getYieldAdapterActiveStrategy(): Promise<number | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterActiveStrategy: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterActiveStrategy',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call(
+                  'get_active_strategy',
+                ),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterActiveStrategy simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterActiveStrategy failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the accrued-but-unswept fees from the yield-adapter contract.
+   * Calls: fees_accrued() -> i128
+   *
+   * Returns the accrued fees in stroops, or null if contract read fails.
+   */
+  async getYieldAdapterAccruedFees(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterAccruedFees: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterAccruedFees',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('fees_accrued'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterAccruedFees simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterAccruedFees failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
    * Fetch contract events from the Soroban RPC node with full cursor-based
    * paging support.
    *

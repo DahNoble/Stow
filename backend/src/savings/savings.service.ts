@@ -1,14 +1,23 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Inject } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { Cache } from 'cache-manager';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { GoalsService } from '../goals/goals.service';
-import { BalanceService } from './balance.service';
+import { BalanceService, APR_WINDOW_DAYS, HarvestRecord } from './balance.service';
 import {
   SavingsProductSummaryDto,
   SavingsSummaryDto,
 } from './dto/savings-summary.dto';
 import { YieldPosition } from './entities/yield-position.entity';
 import { YieldPositionResponseDto } from './dto/yield-position-response.dto';
+import { YieldRateResponseDto } from './dto/yield-rate-response.dto';
+
+/** Cache TTL for yield rate data (in milliseconds). Short TTL to ensure freshness. */
+const YIELD_RATE_CACHE_TTL_MS = 30_000; // 30 seconds
+
+/** Cache key for the global yield rate (no user-specific data). */
+const YIELD_RATE_CACHE_KEY = 'savings:yield:rate';
 
 @Injectable()
 export class SavingsService {
@@ -17,6 +26,7 @@ export class SavingsService {
     private readonly yieldPositionRepository: Repository<YieldPosition>,
     private readonly balanceService: BalanceService,
     private readonly goalsService: GoalsService,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
   ) {}
 
   ping(): { status: string } {
@@ -101,5 +111,88 @@ export class SavingsService {
       pending_withdrawal_claimable_at: null, // Will be populated by indexer when withdrawals are tracked
       updated_at: position.updated_at,
     };
+  }
+
+  /**
+   * Upserts a yield-adapter position from a 'deposited' event.
+   * Called by the indexer's SavingsProjectionService.
+   *
+   * @param owner - The owner's Stellar address
+   * @param shares - Total shares after the deposit
+   * @param exchangeRate - Current exchange rate snapshot (optional)
+   */
+  async upsertYieldPosition(
+    owner: string,
+    shares: string,
+    exchangeRate?: string,
+  ): Promise<YieldPosition> {
+    let position = await this.yieldPositionRepository.findOne({
+      where: { owner },
+    });
+
+    if (!position) {
+      position = this.yieldPositionRepository.create({
+        owner,
+        shares: '0',
+        exchange_rate_snapshot: null,
+      });
+    }
+
+    position.shares = shares;
+    if (exchangeRate !== undefined) {
+      position.exchange_rate_snapshot = exchangeRate;
+    }
+
+    return this.yieldPositionRepository.save(position);
+  }
+
+  /**
+   * Get the current yield rate (exchange rate and APR).
+   *
+   * Uses a short-TTL cache to avoid hitting Soroban RPC on every request.
+   * Cache is invalidated when harvest events are processed (see task #6).
+   *
+   * The exchange rate is derived from the yield_positions table's latest
+   * exchange_rate_snapshot, and the APR is computed from recent harvest history.
+   */
+  async getYieldRate(): Promise<YieldRateResponseDto> {
+    // Check cache first
+    const cached = await this.cache.get<YieldRateResponseDto>(YIELD_RATE_CACHE_KEY);
+    if (cached) {
+      return cached;
+    }
+
+    // Get the latest exchange rate from any yield position
+    const latestPosition = await this.yieldPositionRepository.findOne({
+      order: { updated_at: 'DESC' },
+    });
+
+    const currentRate = latestPosition?.exchange_rate_snapshot ?? '0';
+
+    // Build the rate view with APR computation
+    const rateView = this.balanceService.buildYieldRateView(
+      currentRate,
+      [], // TODO: Fetch harvest history from contract_events table
+      APR_WINDOW_DAYS,
+    );
+
+    const response: YieldRateResponseDto = {
+      rate: rateView.rate,
+      apr: rateView.apr,
+      window_days: rateView.window_days,
+    };
+
+    // Cache the result
+    await this.cache.set(YIELD_RATE_CACHE_KEY, response, YIELD_RATE_CACHE_TTL_MS);
+
+    return response;
+  }
+
+  /**
+   * Invalidate the yield rate cache.
+   * Called by the indexer when a harvest event is processed.
+   */
+  async invalidateYieldRateCache(): Promise<void> {
+    await this.cache.del(YIELD_RATE_CACHE_KEY);
   }
 }

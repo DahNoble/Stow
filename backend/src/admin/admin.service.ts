@@ -21,6 +21,10 @@ import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { ListVerifiedAddressesQueryDto } from './dto/list-verified-addresses-query.dto';
 import { UpdateUserRoleDto } from './dto/update-user-role.dto';
 import { SavingsOverviewDto } from './dto/savings-overview.dto';
+import { YieldAdminOverviewResponseDto, HarvestHistoryEntryDto } from '../savings/dto/yield-admin-overview-response.dto';
+import { ContractEvent } from '../indexer/entities/contract-event.entity';
+import { ConfigService } from '@nestjs/config';
+import { SorobanService } from '../soroban/soroban.service';
 
 /**
  * Administrative operations.
@@ -43,6 +47,10 @@ export class AdminService {
     private readonly verifiedAddressesRepository: Repository<VerifiedAddress>,
     @InjectRepository(AnchorDeposit)
     private readonly anchorDepositRepository: Repository<AnchorDeposit>,
+    @InjectRepository(ContractEvent)
+    private readonly contractEventRepository: Repository<ContractEvent>,
+    private readonly sorobanService: SorobanService,
+    private readonly configService: ConfigService,
   ) {}
 
   async listUsers(query: ListUsersQueryDto) {
@@ -272,5 +280,89 @@ export class AdminService {
       },
       computed_at: new Date().toISOString(),
     };
+  }
+}
+/**
+   * Aggregates yield-adapter metrics for admin overview.
+   *
+   * Returns:
+   *  - active_strategy_id     — id of the currently active strategy, or null if idle
+   *  - active_strategy_name   — display name of the active strategy, if known
+   *  - total_assets           — total assets under management (in stroops)
+   *  - total_shares           — total shares minted (in share units)
+   *  - exchange_rate          — current shares-to-assets ratio (scaled integer as string)
+   *  - accrued_fees           — accrued-but-unswept performance fees (in stroops)
+   *  - harvest_history        — recent harvest events for trend analysis
+   *  - computed_at            — ISO-8601 timestamp of when the query ran
+   */
+  async getYieldOverview(): Promise<YieldAdminOverviewResponseDto> {
+    // Fetch data from multiple sources in parallel where possible
+    const [
+      exchangeRate,
+      totalAssets,
+      totalShares,
+      activeStrategyId,
+      recentHarvests,
+    ] = await Promise.all([
+      this.sorobanService.getYieldAdapterExchangeRate(),
+      this.sorobanService.getYieldAdapterTotalAssets(),
+      this.sorobanService.getYieldAdapterTotalShares(),
+      this.sorobanService.getYieldAdapterActiveStrategy(),
+      this.getRecentHarvestEvents(10),
+    ]);
+
+    // Transform harvest events into the response format
+    const harvestHistory: HarvestHistoryEntryDto[] = recentHarvests.map((h) => ({
+      timestamp: h.ledger ?? 0,
+      delta: h.data?.delta?.toString() ?? '0',
+      fee: h.data?.fee?.toString() ?? '0',
+      total_assets: h.data?.total_assets?.toString() ?? '0',
+    }));
+
+    // Get active strategy name from contract events (stored as strategy_registered events)
+    let activeStrategyName: string | null = null;
+    if (activeStrategyId !== null) {
+      activeStrategyName = await this.getStrategyName(activeStrategyId);
+    }
+
+    // Accrued fees - read from contract storage via soroban service
+    const accruedFees = await this.sorobanService.getYieldAdapterAccruedFees();
+
+    return {
+      active_strategy_id: activeStrategyId,
+      active_strategy_name: activeStrategyName,
+      total_assets: totalAssets ?? '0',
+      total_shares: totalShares ?? '0',
+      exchange_rate: exchangeRate ?? '0',
+      accrued_fees: accruedFees ?? '0',
+      harvest_history: harvestHistory,
+      computed_at: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Fetches recent 'harvested' events from the contract_events table.
+   */
+  private async getRecentHarvestEvents(limit: number): Promise<ContractEvent[]> {
+    return this.contractEventRepository.find({
+      where: { event_type: 'harvested' },
+      order: { ledger: 'DESC' },
+      take: limit,
+    });
+  }
+
+  /**
+   * Looks up a strategy's display name from stored strategy_registered events.
+   */
+  private async getStrategyName(strategyId: number): Promise<string | null> {
+    const event = await this.contractEventRepository.findOne({
+      where: { event_type: 'strategy_registered' },
+      order: { ledger: 'ASC' },
+    });
+
+    if (event?.data?.name) {
+      return String(event.data.name);
+    }
+    return null;
   }
 }
