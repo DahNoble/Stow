@@ -4,12 +4,18 @@ import { apiFetch, ApiError } from "@/lib/api";
 export interface GroupMember {
   address: string;
   contributed: string;
+  /** Basis-point split for settlement (0–10000); 0 until shares are set. */
+  share_bps?: number;
 }
 
 export interface GroupDetail {
   on_chain_id: string;
   name: string;
+  /** Stellar address of the creator; receives settlement rounding dust. */
+  creator?: string | null;
   balance: string;
+  /** Whether the group still accepts members; shares/settle need it closed. */
+  open?: boolean;
   settled: boolean;
   members: GroupMember[];
 }

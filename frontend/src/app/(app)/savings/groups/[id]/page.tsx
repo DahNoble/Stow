@@ -5,6 +5,9 @@ import { Users } from "lucide-react";
 import { useGroupDetail } from "@/hooks/useGroupDetail";
 import ErrorRetry from "@/components/ui/ErrorRetry";
 import { formatStroopsAmount } from "@/lib/currency";
+import { useSession } from "@/context/SessionProvider";
+import GroupSplitSharesEditor from "@/components/savings/GroupSplitSharesEditor";
+import GroupSettleView from "@/components/savings/GroupSettleView";
 
 export default function GroupDetailPage({
   params,
@@ -24,6 +27,7 @@ export default function GroupDetailPage({
   }, [params]);
 
   const { group, status, error, refetch } = useGroupDetail(id);
+  const { address } = useSession();
 
   if (id === null || status === "loading") {
     return (
@@ -118,6 +122,25 @@ export default function GroupDetailPage({
               ))}
             </ul>
           )}
+        </div>
+
+        {!group.settled && (
+          <div className="mt-6">
+            <GroupSplitSharesEditor
+              key={group.members
+                .map((m) => `${m.address}:${m.share_bps ?? 0}`)
+                .join(",")}
+              groupId={group.on_chain_id}
+              members={group.members}
+              canEdit={!!address && address === group.creator}
+              isOpen={group.open ?? false}
+              onSaved={refetch}
+            />
+          </div>
+        )}
+
+        <div className="mt-6">
+          <GroupSettleView group={group} onSettled={refetch} />
         </div>
       </div>
     </div>
