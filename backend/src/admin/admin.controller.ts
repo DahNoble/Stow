@@ -3,6 +3,8 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Patch,
   Post,
@@ -18,7 +20,10 @@ import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { AdminService } from './admin.service';
 import { BanUserDto } from './dto/ban-user.dto';
-import { BulkUserActionDto } from './dto/bulk-user-action.dto';
+import {
+  BulkUserActionDto,
+  BulkUserActionResponseDto,
+} from './dto/bulk-user-action.dto';
 import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { ListVerifiedAddressesQueryDto } from './dto/list-verified-addresses-query.dto';
 import { UpdateUserRoleDto } from './dto/update-user-role.dto';
@@ -104,19 +109,25 @@ export class AdminController {
   }
 
   @Post('users/bulk-action')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(AdminAuditInterceptor)
   @ApiBearerAuth()
   @ApiOperation({
     summary: 'Apply a moderation action (ban/unban/flag) to multiple users',
+    description:
+      'Each user is processed independently. Failures for individual users ' +
+      'are reported per-user and do not roll back or abort the rest of the batch.',
   })
   @ApiResponse({
     status: 200,
     description: 'Per-user result report for the bulk action',
+    type: BulkUserActionResponseDto,
   })
   @ApiResponse({ status: 403, description: 'Forbidden' })
   async bulkUserAction(
     @Body() dto: BulkUserActionDto,
     @Request() req: RequestUser,
-  ) {
+  ): Promise<BulkUserActionResponseDto> {
     return this.adminService.bulkUserAction(
       dto,
       (req as { user: { id: string } }).user.id,

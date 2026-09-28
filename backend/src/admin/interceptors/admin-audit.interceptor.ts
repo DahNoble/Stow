@@ -64,6 +64,34 @@ function resolveTarget(
   return { target_type: null, target_id: id };
 }
 
+interface BulkResponse {
+  succeeded?: number;
+  failed?: number;
+  results?: { user_id: string; success: boolean; code?: string }[];
+}
+
+function buildMetadata(
+  action: string,
+  body: Record<string, unknown> | undefined,
+  response: unknown,
+): Record<string, unknown> | null {
+  if (action !== 'BULK_USER_ACTION' || !response) return body ?? null;
+
+  // Record per-user outcomes so partial failures are traceable in the log.
+  const { succeeded, failed, results = [] } = response as BulkResponse;
+  return {
+    ...(body ?? {}),
+    outcome: {
+      succeeded,
+      failed,
+      succeeded_ids: results.filter((r) => r.success).map((r) => r.user_id),
+      failures: results
+        .filter((r) => !r.success)
+        .map((r) => ({ user_id: r.user_id, code: r.code })),
+    },
+  };
+}
+
 @Injectable()
 export class AdminAuditInterceptor implements NestInterceptor {
   constructor(
@@ -87,7 +115,7 @@ export class AdminAuditInterceptor implements NestInterceptor {
           action,
           target_type,
           target_id,
-          metadata: body ?? null,
+          metadata: buildMetadata(action, body, response),
         });
 
         return from(this.auditRepo.save(entry)).pipe(map(() => response));

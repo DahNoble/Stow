@@ -44,9 +44,24 @@ export class BulkUserActionDto {
   reason?: string;
 }
 
+/**
+ * Machine-readable reason a single user in a bulk action failed. A failure
+ * for one user never aborts the rest of the batch.
+ */
+export enum BulkUserActionErrorCode {
+  NotFound = 'USER_NOT_FOUND',
+  AlreadyBanned = 'ALREADY_BANNED',
+  NotBanned = 'NOT_BANNED',
+  SelfAction = 'SELF_ACTION_FORBIDDEN',
+  ProtectedTarget = 'PROTECTED_TARGET',
+  Internal = 'INTERNAL_ERROR',
+}
+
 export class BulkUserActionResultDto {
   @ApiProperty() user_id: string;
   @ApiProperty() success: boolean;
+  @ApiPropertyOptional({ enum: BulkUserActionErrorCode })
+  code?: BulkUserActionErrorCode;
   @ApiPropertyOptional() error?: string;
 }
 
@@ -54,6 +69,8 @@ export class BulkUserActionResponseDto {
   @ApiProperty({ type: [BulkUserActionResultDto] })
   results: BulkUserActionResultDto[];
 
+  @ApiProperty({ enum: BulkUserAction }) action: BulkUserAction;
+  @ApiProperty() total: number;
   @ApiProperty() succeeded: number;
   @ApiProperty() failed: number;
 }
