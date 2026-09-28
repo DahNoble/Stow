@@ -17,9 +17,11 @@ import { SavingsController } from './savings.controller';
 import { SavingsService } from './savings.service';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 
+import { YieldPosition } from './entities/yield-position.entity';
+
 @Module({
   imports: [
-    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group, GroupMember]),
+    TypeOrmModule.forFeature([AnchorDeposit, Balance, Group, GroupMember, YieldPosition]),
     CacheModule.register({ ttl: 10_000 }),
     GoalsModule,
   ],
