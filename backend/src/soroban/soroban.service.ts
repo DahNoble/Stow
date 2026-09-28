@@ -171,7 +171,9 @@ export class SorobanService {
     this.contractId =
       this.configService.get<string>('SOROBAN_CONTRACT_ID') ?? '';
     this.yieldAdapterContractId =
-      this.configService.get<string>('SOROBAN_YIELD_ADAPTER_CONTRACT_ID') ?? '';
+      this.configService.get<string>('YIELD_ADAPTER_CONTRACT_ID') ??
+      this.configService.get<string>('SOROBAN_YIELD_ADAPTER_CONTRACT_ID') ??
+      '';
     this.network = this.configService.get<string>('STELLAR_NETWORK') ?? '';
     this.serverSecretKey =
       this.configService.get<string>('SERVER_SECRET_KEY') ?? '';

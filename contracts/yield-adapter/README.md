@@ -111,10 +111,401 @@ emergency exit if that trust turns out to be misplaced.
 
 ## Entrypoint reference
 
-See each module's doc comments (`admin.rs`, `strategy.rs`, `deposit.rs`,
-`withdraw.rs`, `accounting.rs`, `harvest.rs`, `fees.rs`,
-`circuit_breaker.rs`) for the authoritative, per-function contract: auth
-requirements, validation order, and errors returned.
+All amounts are `i128` in the vault token's smallest unit (stroops for a 7-decimal
+SEP-41 token like USDC). All timestamps are `u64` ledger timestamps (seconds
+since epoch, per `env.ledger().timestamp()`). Every entrypoint that mutates
+state calls `require_auth()` on the address noted in **Auth** — the caller
+must sign as that address (or hold a valid signature delegation for it).
+Every entrypoint returns `Result<T, Error>` (or a primitive / struct value);
+see [`src/error.rs`](src/error.rs) for the full, stable error enum.
+
+### Consolidated entrypoint reference table
+
+| Category | Function | Auth | Errors | Description |
+| --- | --- | --- | --- | --- |
+| **Lifecycle** | `initialize(admin, treasury, token)` | none | `AlreadyInitialized` | Initialize admin, treasury, and SEP-41 token. |
+| | `admin()` | none (read) | `NotInitialized` | Get configured admin address. |
+| | `treasury()` | none (read) | `NotInitialized` | Get configured treasury address. |
+| | `token()` | none (read) | `NotInitialized` | Get configured SEP-41 token address. |
+| | `set_admin(new_admin)` | admin | `NotInitialized`, `Unauthorized` | Rotate contract admin. |
+| | `set_treasury(caller, new_treasury)` | admin | `NotInitialized`, `Unauthorized` | Set treasury destination for performance fees. |
+| | `performance_fee_bps()` | none (read) | none | Read performance fee in basis points (0–3,000). |
+| | `set_performance_fee_bps(caller, bps)` | admin | `Unauthorized`, `FeeTooHigh` | Set performance fee (max 30% / 3,000 bps). |
+| | `harvest_interval()` | none (read) | none | Minimum seconds required between harvests. |
+| | `set_harvest_interval(caller, seconds)` | admin | `NotInitialized`, `Unauthorized` | Set minimum harvest interval in seconds. |
+| | `set_paused(caller, paused)` | admin | `Unauthorized` | Emergency pause/unpause mutations. |
+| | `is_paused()` | none (read) | none | Check whether the contract is paused. |
+| | `withdraw_cooldown()` | none (read) | none | Read cooldown period in seconds for withdrawals. |
+| | `set_withdraw_cooldown(caller, seconds)` | admin | `Unauthorized` | Set withdrawal cooldown period in seconds. |
+| | `upgrade(caller, new_wasm_hash)` | admin | `Unauthorized` | Upgrade contract Wasm executable. |
+| **Strategy** | `register_strategy(caller, address, name)` | admin | `Unauthorized`, `Paused`, `StrategyAlreadyRegistered` | Register a new yield strategy contract. |
+| | `deregister_strategy(caller, strategy_id)` | admin | `Unauthorized`, `StrategyNotFound`, `StrategyActive` | Deregister an inactive strategy. |
+| | `set_active_strategy(caller, strategy_id)` | admin | `Unauthorized`, `Paused`, `StrategyNotFound`, `StrategyAlreadyActive` | Activate an existing strategy. |
+| | `migrate_strategy(caller, new_strategy_id)` | admin | `Unauthorized`, `Paused`, `StrategyNotFound`, `StrategyAlreadyActive` | Move deployed funds from current to new strategy. |
+| | `set_strategy_deposit_cap(caller, strategy_id, cap)` | admin | `Unauthorized`, `StrategyNotFound`, `InvalidAmount` | Set per-strategy deposit cap (0 = unlimited). |
+| | `get_strategy(strategy_id)` | none (read) | `NotFound` | Look up strategy info by id. |
+| | `list_strategies()` | none (read) | none | List all registered strategies. |
+| **Deposit** | `deposit(from, amount)` | `from` | `Paused`, `InvalidAmount`, `StrategyCapExceeded`, `Overflow` | Deposit vault token and mint proportional shares. |
+| | `get_position(owner)` | none (read) | `NotFound` | Query owner's shares and position metadata. |
+| **Withdraw** | `request_withdraw(owner, shares)` | `owner` | `Paused`, `InvalidAmount`, `InsufficientBalance`, `Overflow` | Burn shares and enqueue cooldown-queued withdrawal. |
+| | `claim_withdraw(owner, request_id)` | `owner` | `Unauthorized`, `NotFound`, `CooldownNotElapsed`, `WithdrawAlreadyResolved` | Claim completed withdrawal after cooldown passes. |
+| | `cancel_withdraw(owner, request_id)` | `owner` | `Unauthorized`, `NotFound`, `WithdrawAlreadyResolved`, `Overflow` | Cancel pending withdrawal and re-mint shares. |
+| | `get_withdraw_request(request_id)` | none (read) | `NotFound` | Query details of a withdrawal request. |
+| **Accounting** | `total_assets()` | none (read) | none | Total assets: idle balance + strategy-deployed funds. |
+| | `total_shares()` | none (read) | none | Total shares outstanding across all positions. |
+| | `exchange_rate()` | none (read) | none | Exchange rate expressed as `(total_assets, total_shares)`. |
+| **Harvest** | `harvest(caller)` | permissionless | `Paused`, `HarvestTooSoon`, `StrategyNotFound`, `Overflow` | Pull yield from active strategy, deduct fee, adjust rate. |
+| **Fees** | `fees_accrued()` | none (read) | none | Accrued performance fees awaiting sweep. |
+| | `withdraw_fees(caller)` | permissionless | `NoFeesAccrued`, `NotInitialized` | Sweep accrued fees to the treasury address. |
+| **Circuit Breaker** | `emergency_withdraw_all(caller)` | admin | `Unauthorized`, `StrategyNotFound` | Emergency pull of all deployed funds back to idle balance. |
+
+---
+
+### Lifecycle & Admin
+
+#### `initialize(admin: Address, treasury: Address, token: Address) -> Result<(), Error>`
+- **Auth:** none (called once immediately following contract deployment).
+- **Errors:** `AlreadyInitialized` if called a second time.
+- **Events:** [`init`](#init).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source deployer --network testnet \
+  -- initialize \
+  --admin $ADMIN_ADDRESS \
+  --treasury $TREASURY_ADDRESS \
+  --token $USDC_TOKEN_ADDRESS
+```
+
+#### `admin() -> Result<Address, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotInitialized`.
+- **Events:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- admin
+```
+
+#### `treasury() -> Result<Address, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotInitialized`.
+- **Events:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- treasury
+```
+
+#### `token() -> Result<Address, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotInitialized`.
+- **Events:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- token
+```
+
+#### `set_admin(new_admin: Address) -> Result<(), Error>`
+- **Auth:** current admin.
+- **Errors:** `NotInitialized`, `Unauthorized` if caller is not the current admin.
+- **Events:** [`admin_set`](#admin_set).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_admin --new_admin $NEW_ADMIN_ADDRESS
+```
+
+#### `set_treasury(caller: Address, new_treasury: Address) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `NotInitialized`, `Unauthorized`.
+- **Events:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_treasury --caller $ADMIN_ADDRESS --new_treasury $NEW_TREASURY_ADDRESS
+```
+
+#### `performance_fee_bps() -> u32`
+- **Auth:** none (read-only).
+- **Returns:** Current fee in basis points (e.g. `1000` = 10%). Defaults to `0`.
+- **Errors:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- performance_fee_bps
+```
+
+#### `set_performance_fee_bps(caller: Address, bps: u32) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `FeeTooHigh` if `bps > 3000` (max 30%).
+- Takes effect on subsequent harvests.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_performance_fee_bps --caller $ADMIN_ADDRESS --bps 1000
+```
+
+#### `harvest_interval() -> u64`
+- **Auth:** none (read-only).
+- **Returns:** Minimum required duration (in seconds) between harvest calls.
+- **Errors:** none.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- harvest_interval
+```
+
+#### `set_harvest_interval(caller: Address, seconds: u64) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `NotInitialized`, `Unauthorized`.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_harvest_interval --caller $ADMIN_ADDRESS --seconds 3600
+```
+
+#### `set_paused(caller: Address, paused: bool) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`.
+- **Events:** [`paused_changed`](#paused_changed).
+- While paused, `deposit`, `request_withdraw`, `harvest`, and strategy mutations reject with `Paused`. `claim_withdraw` remains open.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_paused --caller $ADMIN_ADDRESS --paused true
+```
+
+#### `is_paused() -> bool`
+- **Auth:** none (read-only).
+- **Returns:** `true` if paused, `false` otherwise.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- is_paused
+```
+
+#### `withdraw_cooldown() -> u64`
+- **Auth:** none (read-only).
+- **Returns:** Cooldown delay in seconds before requested withdrawals can be claimed.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- withdraw_cooldown
+```
+
+#### `set_withdraw_cooldown(caller: Address, seconds: u64) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_withdraw_cooldown --caller $ADMIN_ADDRESS --seconds 86400
+```
+
+#### `upgrade(caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`.
+- **Events:** [`upgraded`](#upgraded).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- upgrade --caller $ADMIN_ADDRESS --new_wasm_hash <64-char-hex-hash>
+```
+
+---
+
+### Strategy Management
+
+#### `register_strategy(caller: Address, address: Address, name: String) -> Result<u64, Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `Paused`, `StrategyAlreadyRegistered`.
+- **Events:** [`strategy_registered`](#strategy_registered).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- register_strategy --caller $ADMIN_ADDRESS --address $STRATEGY_ADDRESS --name "DeFi-Lending"
+```
+
+#### `deregister_strategy(caller: Address, strategy_id: u64) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `StrategyNotFound`, `StrategyActive` (cannot deregister the currently active strategy).
+- **Events:** [`strategy_deregistered`](#strategy_deregistered).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- deregister_strategy --caller $ADMIN_ADDRESS --strategy_id 1
+```
+
+#### `set_active_strategy(caller: Address, strategy_id: u64) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `Paused`, `StrategyNotFound`, `StrategyAlreadyActive`.
+- **Events:** [`strategy_changed`](#strategy_changed).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_active_strategy --caller $ADMIN_ADDRESS --strategy_id 1
+```
+
+#### `migrate_strategy(caller: Address, new_strategy_id: u64) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `Paused`, `StrategyNotFound`, `StrategyAlreadyActive`.
+- Unwinds all funds from the current active strategy and redeploys them into the new strategy.
+- **Events:** [`strategy_changed`](#strategy_changed).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- migrate_strategy --caller $ADMIN_ADDRESS --new_strategy_id 2
+```
+
+#### `set_strategy_deposit_cap(caller: Address, strategy_id: u64, cap: i128) -> Result<(), Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `StrategyNotFound`, `InvalidAmount` (if `cap < 0`).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- set_strategy_deposit_cap --caller $ADMIN_ADDRESS --strategy_id 1 --cap 5000000000000
+```
+
+#### `get_strategy(env: Env, strategy_id: u64) -> Result<StrategyInfo, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotFound` if strategy_id does not exist.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- get_strategy --strategy_id 1
+```
+
+#### `list_strategies() -> Vec<StrategyInfo>`
+- **Auth:** none (read-only).
+- **Returns:** List of all registered strategies (including historical/deregistered).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- list_strategies
+```
+
+---
+
+### Deposit & Positions
+
+#### `deposit(from: Address, amount: i128) -> Result<i128, Error>`
+- **Auth:** `from`.
+- **Errors:** `Paused`, `InvalidAmount` (if `amount <= 0`), `StrategyCapExceeded`, `Overflow`.
+- **Returns:** Amount of shares minted.
+- **Events:** [`deposited`](#deposited).
+- **Integrator note:** Shares are calculated using `convert_to_shares` before token transfer so the deposit does not change the rate against the depositor.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- deposit --from $ALICE_ADDRESS --amount 1000000000
+```
+
+#### `get_position(owner: Address) -> Result<Position, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotFound` if `owner` has no position record.
+- **Returns:** `Position` containing `owner`, `shares`, `created_at`, `updated_at`.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- get_position --owner $ALICE_ADDRESS
+```
+
+---
+
+### Withdrawal Queue
+
+#### `request_withdraw(owner: Address, shares: i128) -> Result<u64, Error>`
+- **Auth:** `owner`.
+- **Errors:** `Paused`, `InvalidAmount` (`shares <= 0`), `InsufficientBalance` (`shares > position.shares`), `Overflow`.
+- **Returns:** `request_id` (u64).
+- **Events:** [`withdraw_requested`](#withdraw_requested).
+- **Integrator note:** Shares are burned immediately upon request. The asset payout amount is locked at the current exchange rate and will be claimable after `claimable_at` = current time + `withdraw_cooldown`.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- request_withdraw --owner $ALICE_ADDRESS --shares 500000000
+```
+
+#### `claim_withdraw(owner: Address, request_id: u64) -> Result<i128, Error>`
+- **Auth:** `owner`.
+- **Errors:** `Unauthorized` (if caller != request owner), `NotFound`, `CooldownNotElapsed` (`now < claimable_at`), `WithdrawAlreadyResolved`.
+- **Returns:** Net asset amount paid out.
+- **Events:** [`withdraw_claimed`](#withdraw_claimed).
+- Remains executable even while contract is paused.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- claim_withdraw --owner $ALICE_ADDRESS --request_id 1
+```
+
+#### `cancel_withdraw(owner: Address, request_id: u64) -> Result<(), Error>`
+- **Auth:** `owner`.
+- **Errors:** `Unauthorized`, `NotFound`, `WithdrawAlreadyResolved`, `Overflow`.
+- **Events:** [`withdraw_cancelled`](#withdraw_cancelled).
+- Re-mints shares at the *current* exchange rate corresponding to the locked asset amount.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- cancel_withdraw --owner $ALICE_ADDRESS --request_id 1
+```
+
+#### `get_withdraw_request(request_id: u64) -> Result<WithdrawRequest, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotFound`.
+- **Returns:** `WithdrawRequest` with `id`, `owner`, `shares`, `amount`, `requested_at`, `claimable_at`, `claimed_at`, `cancelled_at`.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- get_withdraw_request --request_id 1
+```
+
+---
+
+### Accounting
+
+#### `total_assets() -> i128`
+- **Auth:** none (read-only).
+- **Returns:** Total asset valuation (idle vault tokens held by adapter + funds reported deployed in the active strategy).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- total_assets
+```
+
+#### `total_shares() -> i128`
+- **Auth:** none (read-only).
+- **Returns:** Total running sum of active shares across all depositors.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- total_shares
+```
+
+#### `exchange_rate() -> (i128, i128)`
+- **Auth:** none (read-only).
+- **Returns:** `(total_assets, total_shares)`.
+- If `total_shares == 0`, rate is effectively 1:1.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- exchange_rate
+```
+
+---
+
+### Harvest & Fees
+
+#### `harvest(caller: Address) -> Result<i128, Error>`
+- **Auth:** permissionless (any caller / keeper).
+- **Errors:** `Paused`, `HarvestTooSoon` (if interval hasn't elapsed), `StrategyNotFound`, `Overflow`.
+- **Returns:** Net delta in assets observed from strategy.
+- **Events:** [`harvested`](#harvested).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source keeper --network testnet \
+  -- harvest --caller $KEEPER_ADDRESS
+```
+
+#### `fees_accrued() -> i128`
+- **Auth:** none (read-only).
+- **Returns:** Total accrued performance fee stroops ready to be swept.
+```bash
+stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
+  -- fees_accrued
+```
+
+#### `withdraw_fees(caller: Address) -> Result<i128, Error>`
+- **Auth:** permissionless (sweeps funds directly to configured `treasury` address).
+- **Errors:** `NoFeesAccrued` (if accrued is 0), `NotInitialized`.
+- **Returns:** Total fee amount transferred to treasury.
+- **Events:** [`fee_collected`](#fee_collected).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source keeper --network testnet \
+  -- withdraw_fees --caller $KEEPER_ADDRESS
+```
+
+---
+
+### Circuit Breaker
+
+#### `emergency_withdraw_all(caller: Address) -> Result<i128, Error>`
+- **Auth:** current admin (`caller`).
+- **Errors:** `Unauthorized`, `StrategyNotFound`.
+- Pulls all deployed capital from the active strategy back into the adapter's idle token balance and clears `ActiveStrategy`. Works even while paused.
+- **Events:** [`strategy_changed`](#strategy_changed) (with `to: None`).
+```bash
+stellar contract invoke --id $CONTRACT_ID --source admin --network testnet \
+  -- emergency_withdraw_all --caller $ADMIN_ADDRESS
+```
 
 ## Storage layout
 

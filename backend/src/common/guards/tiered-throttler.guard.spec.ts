@@ -3,7 +3,7 @@ import { Reflector } from '@nestjs/core';
 import { TieredThrottlerGuard } from './tiered-throttler.guard';
 import { THROTTLE_TIER_KEY } from '../decorators/throttle-tier.decorator';
 import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
-import { ThrottlerStorage } from '@nestjs/throttler';
+import { ThrottlerException, ThrottlerStorage } from '@nestjs/throttler';
 
 describe('TieredThrottlerGuard', () => {
   let guard: TieredThrottlerGuard;
@@ -74,6 +74,47 @@ describe('TieredThrottlerGuard', () => {
       const context = createContext({});
       const result = await guard.canActivate(context);
       expect(result).toBe(true);
+    });
+
+    it('should allow write-tier requests within limit (30 per 60s)', async () => {
+      (reflector.getAllAndOverride as jest.Mock).mockImplementation(
+        (key: string) => {
+          if (key === THROTTLE_TIER_KEY) return 'write';
+          return undefined;
+        },
+      );
+      (mockStorage.increment as jest.Mock).mockResolvedValue({
+        totalHits: 1,
+        timeToExpire: 60000,
+        isBlocked: false,
+        timeToBlockExpire: 0,
+      });
+
+      const context = createContext({ authHeader: 'Bearer token-1' });
+      mockJwtService.decode.mockReturnValue({ sub: 'user-writer' });
+
+      const result = await guard.canActivate(context);
+      expect(result).toBe(true);
+    });
+
+    it('should throw ThrottlerException (429) when write tier limit is exceeded', async () => {
+      (reflector.getAllAndOverride as jest.Mock).mockImplementation(
+        (key: string) => {
+          if (key === THROTTLE_TIER_KEY) return 'write';
+          return undefined;
+        },
+      );
+      (mockStorage.increment as jest.Mock).mockResolvedValue({
+        totalHits: 31,
+        timeToExpire: 45000,
+        isBlocked: true,
+        timeToBlockExpire: 45000,
+      });
+
+      const context = createContext({ authHeader: 'Bearer token-1' });
+      mockJwtService.decode.mockReturnValue({ sub: 'user-writer' });
+
+      await expect(guard.canActivate(context)).rejects.toThrow(ThrottlerException);
     });
   });
 

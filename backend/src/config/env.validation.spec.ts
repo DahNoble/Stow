@@ -8,6 +8,7 @@ describe('Environment Validation', () => {
     STELLAR_NETWORK: 'testnet',
     SOROBAN_CONTRACT_ID: 'CABC123456789DEFGHIJKLMNOPQRSTUVWXYZ123456789012345678',
     USDC_TOKEN_ADDRESS: 'CDEF123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789012345',
+    YIELD_ADAPTER_CONTRACT_ID: 'CGHI123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789012345',
     SERVER_SECRET_KEY: 'secret',
     PORT: '3000',
   };
@@ -94,12 +95,54 @@ describe('Environment Validation', () => {
     });
   });
 
+  describe('YIELD_ADAPTER_CONTRACT_ID validation', () => {
+    it('should accept valid yield adapter contract address', () => {
+      expect(() => validate(validConfig)).not.toThrow();
+    });
+
+    it('should reject yield adapter contract ID not starting with C', () => {
+      const config = {
+        ...validConfig,
+        YIELD_ADAPTER_CONTRACT_ID: 'GGHI123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789012345',
+      };
+
+      expect(() => validate(config)).toThrow(/YIELD_ADAPTER_CONTRACT_ID/);
+      expect(() => validate(config)).toThrow(/valid Stellar contract address/);
+    });
+
+    it('should reject yield adapter contract ID with wrong length', () => {
+      const config = {
+        ...validConfig,
+        YIELD_ADAPTER_CONTRACT_ID: 'CGHI123',
+      };
+
+      expect(() => validate(config)).toThrow(/YIELD_ADAPTER_CONTRACT_ID/);
+    });
+
+    it('should reject missing yield adapter contract ID', () => {
+      const config = { ...validConfig };
+      delete config.YIELD_ADAPTER_CONTRACT_ID;
+
+      expect(() => validate(config)).toThrow(/YIELD_ADAPTER_CONTRACT_ID/);
+    });
+
+    it('should reject empty yield adapter contract ID', () => {
+      const config = {
+        ...validConfig,
+        YIELD_ADAPTER_CONTRACT_ID: '',
+      };
+
+      expect(() => validate(config)).toThrow(/YIELD_ADAPTER_CONTRACT_ID/);
+    });
+  });
+
   describe('Startup behavior', () => {
     it('should fail fast with clear message when savings config is invalid', () => {
       const config = {
         ...validConfig,
         SOROBAN_CONTRACT_ID: 'invalid',
         USDC_TOKEN_ADDRESS: 'invalid',
+        YIELD_ADAPTER_CONTRACT_ID: 'invalid',
       };
 
       let errorMessage = '';
@@ -112,6 +155,7 @@ describe('Environment Validation', () => {
       expect(errorMessage).toContain('Environment validation failed');
       expect(errorMessage).toContain('SOROBAN_CONTRACT_ID');
       expect(errorMessage).toContain('USDC_TOKEN_ADDRESS');
+      expect(errorMessage).toContain('YIELD_ADAPTER_CONTRACT_ID');
       expect(errorMessage).toContain(
         'Please check your .env file and ensure all required variables are set',
       );

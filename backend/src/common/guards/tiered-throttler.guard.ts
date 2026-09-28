@@ -6,6 +6,19 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { THROTTLE_TIER_KEY } from '../decorators/throttle-tier.decorator';
 
+/**
+ * Tiered throttler guard that enforces configurable per-endpoint rate limits.
+ *
+ * Configured rate-limit tiers:
+ * - `default`: 100 requests / 60 s per IP/user
+ * - `auth`: 10 requests / 60 s per IP
+ * - `read`: 200 requests / 60 s per user/IP (e.g. balance reads, quotes)
+ * - `write`: 30 requests / 60 s per user (e.g. savings writes, SEP-24 deposits,
+ *   yield opt-in/deposit, and yield withdrawal requests)
+ *
+ * Exceeding a tier limit rejects the request with HTTP 429 (TooManyRequests),
+ * never a 500 or silent drop.
+ */
 @Injectable()
 export class TieredThrottlerGuard extends ThrottlerGuard {
   constructor(

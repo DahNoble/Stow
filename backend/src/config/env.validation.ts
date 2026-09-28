@@ -53,6 +53,14 @@ class EnvironmentVariables {
 
   @IsString()
   @IsNotEmpty()
+  @Matches(/^C[A-Z0-9]{55}$/, {
+    message:
+      'YIELD_ADAPTER_CONTRACT_ID must be a valid Stellar contract address (starts with C, 56 chars)',
+  })
+  YIELD_ADAPTER_CONTRACT_ID: string;
+
+  @IsString()
+  @IsNotEmpty()
   SERVER_SECRET_KEY: string;
 
   @IsNumber()
