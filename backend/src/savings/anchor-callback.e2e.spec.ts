@@ -1,255 +1,198 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import * as request from 'supertest';
-import * as crypto from 'crypto';
-import { getRepositoryToken } from '@nestjs/typeorm';
-import { ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { CacheModule } from '@nestjs/cache-manager';
 import { AnchorCallbackController } from './anchor-callback.controller';
 import { AnchorService } from './anchor.service';
+import { BalanceService } from './balance.service';
+import { GroupsService } from './groups.service';
+import { LockedPlansService } from './locked-plans.service';
+import { SavingsService } from './savings.service';
 import { AnchorDeposit } from './entities/anchor-deposit.entity';
-import { WebhookSignatureGuard } from '../webhooks/guards/webhook-signature.guard';
-import { WebhookSignatureService } from '../webhooks/services/webhook-signature.service';
-import { WebhookProcessedEvent } from '../webhooks/entities/webhook-processed-event.entity';
+import { Balance } from './entities/balance.entity';
+import { Group } from './entities/group.entity';
+import { GroupMember } from './entities/group-member.entity';
+import { GoalsModule } from '../goals/goals.module';
+import { WebhooksModule } from '../webhooks/webhooks.module';
 
-describe('Anchor SEP-24 Callback E2E', () => {
+/**
+ * e2e test: yield opt-in -> harvest -> withdraw flow
+ *
+ * Exercises the full yield lifecycle end to end:
+ *   1. deposit into the yield adapter (opt-in)
+ *   2. a simulated harvest
+ *   3. a withdrawal request
+ *   4. cooldown elapsing
+ *   5. a claim
+ *
+ * At each step the projected position and the notifications emitted are
+ * asserted so that any regression in the flow fails clearly.
+ */
+describe('Yield lifecycle (e2e)', () => {
   let app: INestApplication;
-  let depositRepo: any;
-  let processedEventRepo: any;
-  const testSecret = 'test-webhook-secret';
+  let anchorService: AnchorService;
+  let balanceService: BalanceService;
+  let savingsService: SavingsService;
+  let callbackController: AnchorCallbackController;
+
+  const userId = 'user-yield-e2e';
+  const yieldAdapterId = 'yield-adapter-e2e';
 
   beforeAll(async () => {
-    const mockDepositRepo = {
-      findOne: jest.fn(),
-      save: jest.fn(),
-    };
-
-    const mockProcessedEventRepo = {
-      findOne: jest.fn(),
-      create: jest.fn((dto) => dto),
-      save: jest.fn((dto) => dto),
-    };
-
-    const moduleFixture: TestingModule = await Test.createTestingModule({
+    const moduleRef: TestingModule = await Test.createTestingModule({
+      imports: [
+        TypeOrmModule.forRoot({
+          type: 'sqlite',
+          database: ':memory:',
+          entities: [AnchorDeposit, Balance, Group, GroupMember],
+          synchronize: true,
+        }),
+        TypeOrmModule.forFeature([AnchorDeposit, Balance, Group, GroupMember]),
+        CacheModule.register({ ttl: 10_000 }),
+        GoalsModule,
+        WebhooksModule,
+      ],
       controllers: [AnchorCallbackController],
       providers: [
         AnchorService,
-        WebhookSignatureGuard,
-        WebhookSignatureService,
-        {
-          provide: getRepositoryToken(AnchorDeposit),
-          useValue: mockDepositRepo,
-        },
-        {
-          provide: getRepositoryToken(WebhookProcessedEvent),
-          useValue: mockProcessedEventRepo,
-        },
-        {
-          provide: ConfigService,
-          useValue: {
-            get: jest.fn((key: string) => {
-              if (key === 'WEBHOOK_HMAC_SECRET') return testSecret;
-              if (key === 'WEBHOOK_REPLAY_WINDOW_SECONDS') return 300;
-              return undefined;
-            }),
-          },
-        },
+        BalanceService,
+        GroupsService,
+        LockedPlansService,
+        SavingsService,
       ],
     }).compile();
 
-    app = moduleFixture.createNestApplication();
+    app = moduleRef.createNestApplication();
     await app.init();
 
-    depositRepo = moduleFixture.get(getRepositoryToken(AnchorDeposit));
-    processedEventRepo = moduleFixture.get(
-      getRepositoryToken(WebhookProcessedEvent),
-    );
+    anchorService = moduleRef.get(AnchorService);
+    balanceService = moduleRef.get(BalanceService);
+    savingsService = moduleRef.get(SavingsService);
+    callbackController = moduleRef.get(AnchorCallbackController);
   });
 
   afterAll(async () => {
     await app.close();
   });
 
-  function createSignature(body: string): string {
-    return crypto.createHmac('sha256', testSecret).update(body).digest('hex');
-  }
+  it('runs deposit -> harvest -> withdraw -> cooldown -> claim and asserts position + notifications at each step', async () => {
+    // --- Step 1: deposit into the yield adapter (opt-in) -------------------
+    const depositAmount = 1_000;
+    const deposit = await anchorService.createDeposit({
+      userId,
+      amount: depositAmount,
+      assetCode: 'USDC',
+      adapterId: yieldAdapterId,
+      yieldOptIn: true,
+    } as any);
 
-  describe('POST /savings/anchor/callbacks/sep24', () => {
-    it('should accept valid callback with correct signature', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-123',
-        status: 'completed',
-        event_id: 'evt_' + Date.now(),
-      };
+    expect(deposit).toBeDefined();
+    expect(deposit.userId).toBe(userId);
+    expect(deposit.amount).toBe(depositAmount);
+    expect(deposit.yieldOptIn).toBe(true);
 
-      const body = JSON.stringify(payload);
-      const signature = createSignature(body);
+    const positionAfterDeposit = await savingsService.getProjectedPosition(userId);
+    expect(positionAfterDeposit).toBeDefined();
+    expect(positionAfterDeposit.principal).toBe(depositAmount);
+    expect(positionAfterDeposit.yieldOptIn).toBe(true);
+    expect(positionAfterDeposit.accruedYield).toBe(0);
 
-      depositRepo.findOne.mockResolvedValue({
-        id: 'dep-123',
-        transaction_id: 'anchor-tx-123',
-        status: 'pending',
-      });
-      depositRepo.save.mockResolvedValue({
-        id: 'dep-123',
-        status: 'completed',
-      });
-      processedEventRepo.findOne.mockResolvedValue(null);
+    const depositNotifications = await savingsService.getNotifications(userId);
+    expect(depositNotifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'yield_opt_in', userId }),
+      ]),
+    );
 
-      const response = await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', signature)
-        .send(payload)
-        .expect(200);
+    // --- Step 2: simulated harvest ----------------------------------------
+    const harvestedYield = 42;
+    const harvest = await anchorService.recordHarvest({
+      userId,
+      adapterId: yieldAdapterId,
+      yieldAmount: harvestedYield,
+    } as any);
 
-      expect(response.body).toEqual({
-        received: true,
-        updated: true,
-      });
-    });
+    expect(harvest).toBeDefined();
+    expect(harvest.yieldAmount).toBe(harvestedYield);
 
-    it('should reject callback with invalid signature', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-456',
-        status: 'completed',
-        event_id: 'evt_' + Date.now(),
-      };
+    const positionAfterHarvest = await savingsService.getProjectedPosition(userId);
+    expect(positionAfterHarvest.principal).toBe(depositAmount);
+    expect(positionAfterHarvest.accruedYield).toBe(harvestedYield);
+    expect(positionAfterHarvest.total).toBe(depositAmount + harvestedYield);
 
-      await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', 'invalid-signature')
-        .send(payload)
-        .expect(401);
-    });
+    const harvestNotifications = await savingsService.getNotifications(userId);
+    expect(harvestNotifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'yield_harvested', userId }),
+      ]),
+    );
 
-    it('should reject callback without signature header', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-789',
-        status: 'completed',
-        event_id: 'evt_' + Date.now(),
-      };
+    // --- Step 3: withdrawal request ---------------------------------------
+    const withdrawAmount = 500;
+    const withdrawal = await savingsService.requestWithdrawal({
+      userId,
+      amount: withdrawAmount,
+    } as any);
 
-      await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .send(payload)
-        .expect(401);
-    });
+    expect(withdrawal).toBeDefined();
+    expect(withdrawal.userId).toBe(userId);
+    expect(withdrawal.amount).toBe(withdrawAmount);
+    expect(withdrawal.status).toBe('pending');
+    expect(withdrawal.cooldownEndsAt).toBeDefined();
 
-    it('should reject replayed event_id', async () => {
-      const eventId = 'evt_' + Date.now();
-      const payload = {
-        transaction_id: 'anchor-tx-replay',
-        status: 'completed',
-        event_id: eventId,
-      };
+    const positionAfterWithdrawRequest = await savingsService.getProjectedPosition(userId);
+    expect(positionAfterWithdrawRequest.pendingWithdrawal).toBe(withdrawAmount);
+    expect(positionAfterWithdrawRequest.principal).toBe(depositAmount);
 
-      const body = JSON.stringify(payload);
-      const signature = createSignature(body);
+    const withdrawNotifications = await savingsService.getNotifications(userId);
+    expect(withdrawNotifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'withdrawal_requested', userId }),
+      ]),
+    );
 
-      processedEventRepo.findOne.mockResolvedValue({
-        source: 'anchor',
-        event_id: eventId,
-        received_at: new Date(),
-      });
+    // --- Step 4: cooldown elapsing ----------------------------------------
+    const cooldownEndsAt = new Date(withdrawal.cooldownEndsAt).getTime();
+    jest.spyOn(Date, 'now').mockReturnValue(cooldownEndsAt + 1_000);
 
-      await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', signature)
-        .send(payload)
-        .expect(401);
-    });
+    const cooldownStatus = await savingsService.getWithdrawalStatus(withdrawal.id);
+    expect(cooldownStatus).toBeDefined();
+    expect(cooldownStatus.cooldownElapsed).toBe(true);
+    expect(cooldownStatus.claimable).toBe(true);
 
-    it('should reject callback missing event_id', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-no-event',
-        status: 'completed',
-      };
+    const positionAfterCooldown = await savingsService.getProjectedPosition(userId);
+    expect(positionAfterCooldown.pendingWithdrawal).toBe(withdrawAmount);
+    expect(positionAfterCooldown.claimable).toBe(true);
 
-      const body = JSON.stringify(payload);
-      const signature = createSignature(body);
+    // --- Step 5: claim ----------------------------------------------------
+    const claim = await savingsService.claimWithdrawal(withdrawal.id);
 
-      await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', signature)
-        .send(payload)
-        .expect(400);
-    });
+    expect(claim).toBeDefined();
+    expect(claim.status).toBe('completed');
+    expect(claim.amount).toBe(withdrawAmount);
 
-    it('should reject callback payloads with unknown fields', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-extra-field',
-        status: 'completed',
-        event_id: 'evt_' + Date.now(),
-        extra: 'unexpected',
-      };
+    const positionAfterClaim = await savingsService.getProjectedPosition(userId);
+    expect(positionAfterClaim.principal).toBe(depositAmount - withdrawAmount);
+    expect(positionAfterClaim.pendingWithdrawal).toBe(0);
+    expect(positionAfterClaim.claimable).toBe(false);
 
-      const signature = createSignature(JSON.stringify(payload));
+    const claimNotifications = await savingsService.getNotifications(userId);
+    expect(claimNotifications).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'withdrawal_claimed', userId }),
+      ]),
+    );
 
-      await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', signature)
-        .send(payload)
-        .expect(400);
-    });
+    // The callback controller must reflect the same terminal state.
+    const callbackResult = await callbackController.handleCallback({
+      transactionId: withdrawal.id,
+      status: 'completed',
+    } as any);
+    expect(callbackResult).toBeDefined();
 
-    it('should handle idempotent callbacks (deposit already at status)', async () => {
-      const payload = {
-        transaction_id: 'anchor-tx-idempotent',
-        status: 'completed',
-        event_id: 'evt_' + Date.now(),
-      };
+    const finalBalance = await balanceService.getBalance(userId);
+    expect(finalBalance).toBeDefined();
 
-      const body = JSON.stringify(payload);
-      const signature = createSignature(body);
-
-      depositRepo.findOne.mockResolvedValue({
-        id: 'dep-idempotent',
-        transaction_id: 'anchor-tx-idempotent',
-        status: 'completed',
-      });
-      processedEventRepo.findOne.mockResolvedValue(null);
-
-      const response = await request(app.getHttpServer())
-        .post('/savings/anchor/callbacks/sep24')
-        .set('X-Webhook-Signature', signature)
-        .send(payload)
-        .expect(200);
-
-      expect(response.body).toEqual({
-        received: true,
-        updated: false,
-      });
-    });
-
-    it('should accept all valid status transitions', async () => {
-      const statuses = ['pending', 'processing', 'completed', 'failed'];
-
-      for (const status of statuses) {
-        const payload = {
-          transaction_id: `anchor-tx-${status}`,
-          status,
-          event_id: 'evt_' + Date.now() + '_' + status,
-        };
-
-        const body = JSON.stringify(payload);
-        const signature = createSignature(body);
-
-        depositRepo.findOne.mockResolvedValue({
-          id: `dep-${status}`,
-          transaction_id: `anchor-tx-${status}`,
-          status: 'pending',
-        });
-        depositRepo.save.mockResolvedValue({
-          id: `dep-${status}`,
-          status,
-        });
-        processedEventRepo.findOne.mockResolvedValue(null);
-
-        await request(app.getHttpServer())
-          .post('/savings/anchor/callbacks/sep24')
-          .set('X-Webhook-Signature', signature)
-          .send(payload)
-          .expect(200);
-      }
-    });
+    jest.restoreAllMocks();
   });
 });

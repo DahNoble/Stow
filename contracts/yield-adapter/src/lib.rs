@@ -41,6 +41,8 @@ mod types;
 mod withdraw;
 
 #[cfg(test)]
+mod mock_strategy;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
@@ -89,6 +91,14 @@ impl YieldAdapter {
 
     pub fn set_performance_fee_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
         admin::set_performance_fee_bps(&env, caller, bps)
+    }
+
+    pub fn harvest_interval(env: Env) -> u64 {
+        admin::harvest_interval(&env)
+    }
+
+    pub fn set_harvest_interval(env: Env, caller: Address, seconds: u64) -> Result<(), Error> {
+        admin::set_harvest_interval(&env, caller, seconds)
     }
 
     pub fn set_paused(env: Env, caller: Address, paused: bool) -> Result<(), Error> {

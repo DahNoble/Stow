@@ -1,47 +1,51 @@
-"use client";
+import React from 'react';
+import { useYieldRate } from './useYieldRate';
 
-export interface Position {
+interface Position {
   id: string;
-  amount: string;
-  value: number;
-  assetCode: string;
+  amount: number;
+  currency: string;
+  openedAt: string;
 }
 
-export interface PositionCardProps {
+interface PositionCardProps {
   position: Position;
-  /** Formatted value string (using locale-aware formatYieldAmount) */
-  formattedValue: string;
 }
 
-export default function PositionCard({
-  position,
-  formattedValue,
-}: PositionCardProps) {
-  return (
-    <article
-      className="rounded-lg border border-border bg-card p-4"
-      aria-labelledby={`position-title-${position.id}`}
-    >
-      <header>
-        <h3
-          id={`position-title-${position.id}`}
-          className="text-sm font-medium text-muted"
-        >
-          Position Value
-        </h3>
-      </header>
+function formatApr(rate: number): string {
+  return `${(rate * 100).toFixed(2)}%`;
+}
 
-      <div className="mt-2">
-        <p
-          className="text-2xl font-bold"
-          aria-label={`Position value: ${formattedValue}`}
-        >
-          {formattedValue}
-        </p>
-        <p className="mt-1 text-xs text-muted">
-          {position.amount} {position.assetCode}
-        </p>
+export function PositionCard({ position }: PositionCardProps) {
+  const { rate, loading, error } = useYieldRate();
+
+  return (
+    <div className="position-card">
+      <div className="position-card__header">
+        <span className="position-card__amount">
+          {position.amount} {position.currency}
+        </span>
+        <span className="position-card__opened">
+          Opened {new Date(position.openedAt).toLocaleDateString()}
+        </span>
       </div>
-    </article>
+      <div className="position-card__apr" data-testid="position-card-apr">
+        {loading ? (
+          <span className="apr-loading" data-testid="apr-loading">
+            Loading APR…
+          </span>
+        ) : error ? (
+          <span className="apr-error" data-testid="apr-error">
+            APR unavailable
+          </span>
+        ) : (
+          <span className="apr-value" data-testid="apr-value">
+            APR {rate !== null ? formatApr(rate) : '—'}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
+
+export default PositionCard;

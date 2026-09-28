@@ -9,6 +9,8 @@ import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 import { AdminAuditLog } from './entities/admin-audit-log.entity';
 import { AdminAuditInterceptor } from './interceptors/admin-audit.interceptor';
+import { ContractEvent } from '../indexer/entities/contract-event.entity';
+import { SorobanModule } from '../soroban/soroban.module';
 
 @Module({
   imports: [
@@ -18,8 +20,10 @@ import { AdminAuditInterceptor } from './interceptors/admin-audit.interceptor';
       VerifiedAddress,
       AnchorDeposit,
       AdminAuditLog,
+      ContractEvent,
     ]),
     CacheModule.register(),
+    SorobanModule,
   ],
   controllers: [AdminController],
   providers: [AdminService, AdminAuditInterceptor],

@@ -8,55 +8,22 @@
 //!
 //! Tests that exercise a strategy (`harvest`, `migrate_strategy`, ...) will
 //! additionally need a minimal mock strategy contract implementing the
-//! interface documented in `README.md` under "Strategy interface"; building
-//! that mock is issue-worthy on its own (see the module doc below) and does
-//! not exist yet, so those tests cannot be un-ignored until it does.
+//! interface documented in `README.md` under "Strategy interface" — use
+//! `crate::mock_strategy::MockStrategy` (via `setup_mock_strategy`).
 
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, testutils::Events as _, Address, Env, IntoVal,
-    Symbol,
+    testutils::Address as _, testutils::Events as _, Address, Env, IntoVal, Symbol,
 };
 
 use crate::error::Error;
+use crate::types::DataKey;
 use crate::{YieldAdapter, YieldAdapterClient};
 
 // ---------------------------------------------------------------------------
-// Mock strategy — a minimal real contract implementing the "Strategy
-// interface" documented in README.md (`deposit`, `withdraw`, `balance`), so
-// #245/#246's event-publisher tests can exercise register/activate/migrate
-// and harvest/fee flows end to end. A fuller-featured mock (configurable
-// simulated yield curves, failure injection, etc.) is tracked separately as
-// issue #251; this is deliberately the minimum needed to make THIS PR's own
-// new tests real.
-#[contract]
-pub struct MockStrategy;
-
-#[contractimpl]
-impl MockStrategy {
-    pub fn deposit(env: Env, from: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), from);
-        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-        env.storage().instance().set(&key, &(current + amount));
-    }
-
-    pub fn withdraw(env: Env, to: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), to);
-        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
-        env.storage().instance().set(&key, &(current - amount));
-    }
-
-    pub fn balance(env: Env, of: Address) -> i128 {
-        let key = (Symbol::new(&env, "bal"), of);
-        env.storage().instance().get(&key).unwrap_or(0)
-    }
-
-    /// Test-only: simulate yield/loss by directly setting the reported
-    /// balance, independent of actual deposit/withdraw calls.
-    pub fn set_reported_balance(env: Env, of: Address, amount: i128) {
-        let key = (Symbol::new(&env, "bal"), of);
-        env.storage().instance().set(&key, &amount);
-    }
-}
+// Mock strategy — see `crate::mock_strategy` for the full interface and test
+// knobs (simulated yield/loss, failure injection, withdrawal haircut,
+// token-backed mode).
+use crate::mock_strategy::{MockStrategy, MockStrategyClient};
 
 fn setup_mock_strategy(env: &Env) -> Address {
     env.register(MockStrategy, ())
@@ -66,7 +33,7 @@ fn setup_mock_strategy(env: &Env) -> Address {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn setup(env: &Env) -> YieldAdapterClient {
+fn setup(env: &Env) -> YieldAdapterClient<'_> {
     let contract_id = env.register(YieldAdapter, ());
     YieldAdapterClient::new(env, &contract_id)
 }
@@ -74,7 +41,7 @@ fn setup(env: &Env) -> YieldAdapterClient {
 /// Full setup: adapter + SEP-41 mock token + admin + treasury.
 ///
 /// Returns `(client, admin, treasury, token_address)`.
-fn setup_with_token(env: &Env) -> (YieldAdapterClient, Address, Address, Address) {
+fn setup_with_token(env: &Env) -> (YieldAdapterClient<'_>, Address, Address, Address) {
     let client = setup(env);
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
@@ -86,6 +53,224 @@ fn setup_with_token(env: &Env) -> (YieldAdapterClient, Address, Address, Address
     client.initialize(&admin, &treasury, &token_address);
 
     (client, admin, treasury, token_address)
+}
+
+// ---------------------------------------------------------------------------
+// Pure-logic unit tests — no `Env`/contract needed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_fee_bps_boundary() {
+    assert!(crate::fees::validate_fee_bps(crate::fees::MAX_PERFORMANCE_FEE_BPS).is_ok());
+    assert_eq!(
+        crate::fees::validate_fee_bps(crate::fees::MAX_PERFORMANCE_FEE_BPS + 1),
+        Err(Error::FeeTooHigh),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct unit tests — `harvest::apply_performance_fee` and
+// `harvest::check_harvest_interval` exercised directly (not through the
+// `harvest` entrypoint).
+//
+// `harvest` itself, and thus the end-to-end
+// `performance_fee_taken_only_on_positive_yield` /
+// `loss_reduces_exchange_rate_without_charging_fee` acceptance tests below,
+// need a mock strategy contract that doesn't exist yet (see the module doc
+// above) and are covered by a separate, unassigned issue. These tests give
+// `apply_performance_fee` and `check_harvest_interval` real coverage in the
+// meantime using `env.as_contract` to reach contract storage without going
+// through `harvest`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_performance_fee_credits_fees_accrued_and_returns_remainder() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceFeeBps, &1_000u32); // 10%
+
+        let remainder = crate::harvest::apply_performance_fee(&env, 1_000).unwrap();
+
+        assert_eq!(remainder, 900);
+        let fees_accrued: i128 = env.storage().instance().get(&DataKey::FeesAccrued).unwrap();
+        assert_eq!(fees_accrued, 100);
+    });
+}
+
+#[test]
+fn apply_performance_fee_accumulates_across_calls() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceFeeBps, &500u32); // 5%
+
+        crate::harvest::apply_performance_fee(&env, 2_000).unwrap();
+        crate::harvest::apply_performance_fee(&env, 4_000).unwrap();
+
+        let fees_accrued: i128 = env.storage().instance().get(&DataKey::FeesAccrued).unwrap();
+        // 2_000 * 500 / 10_000 = 100; 4_000 * 500 / 10_000 = 200.
+        assert_eq!(fees_accrued, 300);
+    });
+}
+
+#[test]
+fn apply_performance_fee_zero_bps_credits_nothing() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        // `PerformanceFeeBps` left unset — defaults to 0 per `admin::performance_fee_bps`.
+        let remainder = crate::harvest::apply_performance_fee(&env, 5_000).unwrap();
+
+        assert_eq!(remainder, 5_000);
+        let fees_accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeesAccrued)
+            .unwrap_or(0);
+        assert_eq!(fees_accrued, 0);
+    });
+}
+
+#[test]
+fn check_harvest_interval_default_allows_immediate_harvest() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        // No `HarvestInterval` / `LastHarvestAt` set — first-ever harvest must
+        // never be blocked.
+        assert!(crate::harvest::check_harvest_interval(&env).is_ok());
+    });
+}
+
+#[test]
+fn check_harvest_interval_rejects_too_soon() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    let start: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: start,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::HarvestInterval, &3_600u64); // 1 hour
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHarvestAt, &start);
+
+        // Not enough time has elapsed yet.
+        env.ledger().set(LedgerInfo {
+            timestamp: start + 1_800, // 30 minutes later
+            protocol_version: 22,
+            sequence_number: 200,
+            network_id: Default::default(),
+            base_reserve: 5_000_000,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 3_110_400,
+        });
+        assert_eq!(
+            crate::harvest::check_harvest_interval(&env),
+            Err(Error::HarvestTooSoon),
+        );
+    });
+}
+
+#[test]
+fn check_harvest_interval_allows_after_elapsed() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    let start: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: start,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::HarvestInterval, &3_600u64); // 1 hour
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHarvestAt, &start);
+
+        // A full hour (plus one second) has elapsed.
+        env.ledger().set(LedgerInfo {
+            timestamp: start + 3_601,
+            protocol_version: 22,
+            sequence_number: 300,
+            network_id: Default::default(),
+            base_reserve: 5_000_000,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 3_110_400,
+        });
+        assert!(crate::harvest::check_harvest_interval(&env).is_ok());
+    });
+}
+
+#[test]
+fn set_and_get_harvest_interval_mirrors_withdraw_cooldown_shape() {
+    // `admin::initialize` is unimplemented (a separate, unassigned issue), so
+    // this seeds `DataKey::Admin` directly rather than going through
+    // `client.initialize(..)`.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(YieldAdapter, ());
+    let client = YieldAdapterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    assert_eq!(client.harvest_interval(), 0);
+
+    client.set_harvest_interval(&admin, &7_200u64);
+    assert_eq!(client.harvest_interval(), 7_200);
+}
+
+#[test]
+fn set_harvest_interval_rejects_non_admin_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(YieldAdapter, ());
+    let client = YieldAdapterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    let result = client.try_set_harvest_interval(&impostor, &7_200u64);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.harvest_interval(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,14 +304,23 @@ fn admin_treasury_token_error_before_initialize() {
 }
 
 #[test]
-#[ignore = "TODO(issue): implement deposit::deposit + accounting::convert_to_shares"]
 fn deposit_mints_shares_proportional_to_exchange_rate() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _treasury, _token) = setup_with_token(&env);
-    let _user = Address::generate(&env);
-    // On the very first deposit, shares must be minted 1:1 with assets.
-    todo!("deposit `amount`, assert `get_position(user).shares == amount`");
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let user = Address::generate(&env);
+
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&user, &1_000);
+
+    // First deposit: shares minted 1:1 with assets.
+    let shares = client.deposit(&user, &1_000);
+    assert_eq!(shares, 1_000, "first deposit must mint shares 1:1");
+
+    let position = client.get_position(&user);
+    assert_eq!(position.shares, 1_000);
+    assert_eq!(position.owner, user);
+    assert_eq!(client.total_shares(), 1_000);
 }
 
 #[test]
@@ -142,9 +336,82 @@ fn claim_before_cooldown_elapsed_rejected() {
 }
 
 #[test]
-#[ignore = "TODO(issue): implement withdraw::cancel_withdraw"]
 fn cancel_withdraw_returns_shares_to_owner() {
-    todo!("request_withdraw, cancel_withdraw, assert position shares restored");
+    use crate::types::{DataKey, Position, WithdrawRequest};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let request_id = 1u64;
+    let now = env.ledger().timestamp();
+
+    // `request_withdraw` is a separate, still-unimplemented issue (see
+    // `withdraw_round_trip_returns_correct_assets`), so seed the state it
+    // would have left behind directly: an owner position already debited by
+    // the 400 shares burned at request time, a matching `WithdrawRequest`
+    // whose `shares` field holds the asset amount fixed at that moment (per
+    // `request_withdraw`'s doc comment), and a vault-wide `TotalShares` net
+    // of that burn.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &600i128);
+        env.storage().persistent().set(
+            &DataKey::Position(owner.clone()),
+            &Position {
+                owner: owner.clone(),
+                shares: 600,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::WithdrawRequest(request_id),
+            &WithdrawRequest {
+                id: request_id,
+                owner: owner.clone(),
+                shares: 400,
+                claimable_at: now,
+                requested_at: now,
+                claimed_at: None,
+                cancelled_at: None,
+            },
+        );
+    });
+
+    // The vault holds 600 idle tokens against the 600 shares seeded above —
+    // a 1:1 exchange rate — so re-minting the request's fixed 400-asset
+    // amount should hand back exactly 400 shares.
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client.address, &600);
+
+    client.cancel_withdraw(&owner, &request_id);
+
+    let position: Position = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Position(owner.clone()))
+            .unwrap()
+    });
+    assert_eq!(
+        position.shares, 1000,
+        "the 400 re-minted shares must be added back to the owner's existing 600"
+    );
+    assert_eq!(client.total_shares(), 1000);
+
+    let request: WithdrawRequest = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WithdrawRequest(request_id))
+            .unwrap()
+    });
+    assert!(request.cancelled_at.is_some());
+
+    // The request is now resolved — cancelling it again (standing in for a
+    // later claim attempt, since `claim_withdraw` checks the same flag) must
+    // reject rather than re-mint a second time.
+    let result = client.try_cancel_withdraw(&owner, &request_id);
+    assert_eq!(result, Err(Ok(Error::WithdrawAlreadyResolved)));
 }
 
 #[test]
@@ -944,9 +1211,9 @@ fn total_shares_returns_zero_before_initialize() {
     use crate::accounting::total_shares;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Before initialization, total_shares should return 0
-    let shares = total_shares(&env);
+    let shares = env.as_contract(&client.address, || total_shares(&env));
     assert_eq!(shares, 0, "total_shares should be 0 before any deposits");
 }
 
@@ -955,9 +1222,9 @@ fn total_assets_returns_zero_before_initialize() {
     use crate::accounting::total_assets;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Before initialization (no token set), total_assets should return 0
-    let assets = total_assets(&env);
+    let assets = env.as_contract(&client.address, || total_assets(&env));
     assert_eq!(assets, 0, "total_assets should be 0 before initialization");
 }
 
@@ -984,13 +1251,15 @@ fn total_shares_reflects_running_total() {
     use crate::types::DataKey;
 
     let env = Env::default();
+    let client = setup(&env);
 
-    // Manually set TotalShares to test the read
-    env.storage()
-        .instance()
-        .set(&DataKey::TotalShares, &1000i128);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &1000i128);
+    });
 
-    let shares = total_shares(&env);
+    let shares = env.as_contract(&client.address, || total_shares(&env));
     assert_eq!(shares, 1000, "total_shares should reflect stored value");
 }
 

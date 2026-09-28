@@ -11,12 +11,18 @@ import { DataSource, LessThan, Repository } from 'typeorm';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { DataExportJob } from './entities/data-export-job.entity';
+import { YieldPosition } from '../savings/entities/yield-position.entity';
+import { ContractEvent } from '../indexer/entities/contract-event.entity';
 
 @Injectable()
 export class AccountService {
   constructor(
     @InjectRepository(DataExportJob)
     private readonly jobRepo: Repository<DataExportJob>,
+    @InjectRepository(YieldPosition)
+    private readonly yieldPositionRepository: Repository<YieldPosition>,
+    @InjectRepository(ContractEvent)
+    private readonly contractEventRepository: Repository<ContractEvent>,
     @InjectDataSource()
     private readonly dataSource: DataSource,
     private readonly configService: ConfigService,
@@ -120,6 +126,8 @@ export class AccountService {
       competitions,
       leaderboard,
       notifications,
+      yieldPosition,
+      harvestHistory,
     ] = await Promise.all([
       this.dataSource.query(`SELECT * FROM predictions WHERE "userId" = $1`, [
         userId,
@@ -151,7 +159,27 @@ export class AccountService {
          FROM notifications WHERE user_address = $1 ORDER BY created_at DESC LIMIT 1000`,
         [profile.stellar_address],
       ),
+      // Fetch yield-adapter position for this user
+      this.yieldPositionRepository.findOne({
+        where: { owner: profile.stellar_address },
+      }),
+      // Fetch harvest history attribution for this user
+      this.getHarvestAttributionHistory(profile.stellar_address),
     ]);
+
+    // Build yield data only if position exists
+    const yieldData = yieldPosition
+      ? {
+          yield_position: {
+            owner: yieldPosition.owner,
+            shares: yieldPosition.shares,
+            exchange_rate_snapshot: yieldPosition.exchange_rate_snapshot,
+            created_at: yieldPosition.created_at,
+            updated_at: yieldPosition.updated_at,
+          },
+          harvest_history: harvestHistory,
+        }
+      : undefined;
 
     return {
       exported_at: new Date().toISOString(),
@@ -164,7 +192,87 @@ export class AccountService {
       follows,
       competitions,
       leaderboard_history: leaderboard,
+      ...yieldData,
     };
+  }
+
+  /**
+   * Fetches harvest attribution history for a specific user.
+   * Computes the user's share at each harvest and attributes yield proportionally.
+   */
+  private async getHarvestAttributionHistory(
+    ownerAddress: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    // Get the user's yield position
+    const position = await this.yieldPositionRepository.findOne({
+      where: { owner: ownerAddress },
+    });
+
+    if (!position) {
+      return [];
+    }
+
+    // Get recent harvested events
+    const harvests = await this.contractEventRepository.find({
+      where: { event_type: 'harvested' },
+      order: { ledger: 'DESC' },
+      take: 100,
+    });
+
+    // Get deposited events to compute user's share at each harvest
+    const deposits = await this.contractEventRepository.find({
+      where: { event_type: 'deposited' },
+      order: { ledger: 'ASC' },
+    });
+
+    // Filter deposits for this owner and map to share changes
+    const ownerDeposits = deposits
+      .filter((d) => d.data?.owner === ownerAddress)
+      .map((d) => ({
+        ledger: d.ledger,
+        shares_minted: d.data?.shares_minted ?? '0',
+      }));
+
+    // Build attribution history
+    const history: Array<Record<string, unknown>> = [];
+    for (const harvest of harvests) {
+      const harvestLedger = harvest.ledger ?? 0;
+      const totalShares = BigInt(harvest.data?.total_shares ?? '1');
+      const delta = BigInt(harvest.data?.delta ?? '0');
+      const fee = BigInt(harvest.data?.fee ?? '0');
+      const netYield = delta - fee;
+
+      // Calculate user's share at harvest time
+      let userSharesAtHarvest = BigInt(0);
+      for (const deposit of ownerDeposits) {
+        if (deposit.ledger <= harvestLedger) {
+          userSharesAtHarvest += BigInt(deposit.shares_minted);
+        }
+      }
+
+      // Calculate attributed yield
+      let attributedYield = '0';
+      if (totalShares > 0n && userSharesAtHarvest > 0n) {
+        attributedYield = (
+          (netYield * userSharesAtHarvest) /
+          totalShares
+        ).toString();
+      }
+
+      if (userSharesAtHarvest > 0n) {
+        history.push({
+          ledger: harvestLedger,
+          delta: harvest.data?.delta?.toString() ?? '0',
+          fee: harvest.data?.fee?.toString() ?? '0',
+          total_assets: harvest.data?.total_assets?.toString() ?? '0',
+          total_shares: totalShares.toString(),
+          user_shares_at_harvest: userSharesAtHarvest.toString(),
+          attributed_yield: attributedYield,
+        });
+      }
+    }
+
+    return history;
   }
 
   async deleteAccount(userId: string): Promise<void> {

@@ -27,6 +27,8 @@ import { ListGoalsDto } from './dto/list-goals.dto';
 import { ListLockedDto } from './dto/list-locked.dto';
 import { SavingsSummaryDto } from './dto/savings-summary.dto';
 import { YieldPositionResponseDto } from './dto/yield-position-response.dto';
+import { YieldRateResponseDto } from './dto/yield-rate-response.dto';
+import { YieldAdminOverviewResponseDto } from './dto/yield-admin-overview-response.dto';
 import { SavingsAddressListQueryDto } from './dto/savings-list-query.dto';
 import { SavingsAddressParamDto } from './dto/stellar-address.dto';
 import { SavingsService } from './savings.service';
@@ -220,5 +222,44 @@ export class SavingsController {
     @CurrentUser() user: User,
   ): Promise<YieldPositionResponseDto> {
     return this.savingsService.getYieldPosition(user.stellar_address);
+  }
+
+  /**
+   * GET /savings/yield/rate
+   *
+   * Returns the current yield-adapter rate (APR/APY) and the timestamp it
+   * was last observed. Public — no authentication required.
+   */
+  @Get('yield/rate')
+  @Public()
+  @ApiOperation({ summary: 'Get the current yield rate (APR/APY)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Current yield rate and last-observed timestamp',
+    type: YieldRateResponseDto,
+  })
+  async getYieldRate(): Promise<YieldRateResponseDto> {
+    return this.savingsService.getYieldRate();
+  }
+
+  /**
+   * GET /savings/yield/admin/overview
+   *
+   * Returns an admin-facing overview of the yield adapter: total shares,
+   * total estimated value, and the number of active positions. Requires
+   * authentication.
+   */
+  @Get('yield/admin/overview')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get the admin yield adapter overview' })
+  @ApiResponse({
+    status: 200,
+    description: 'Aggregate yield adapter totals and active position count',
+    type: YieldAdminOverviewResponseDto,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async getYieldAdminOverview(): Promise<YieldAdminOverviewResponseDto> {
+    return this.savingsService.getYieldAdminOverview();
   }
 }

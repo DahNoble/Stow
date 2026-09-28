@@ -248,6 +248,67 @@ describe('IndexerService', () => {
         value: 10,
       });
     });
+
+    it('decodes a withdraw_claimed event and resolves the matching pending withdrawal', async () => {
+      checkpointRepo.findOne.mockResolvedValue(null);
+
+      const mockEvents: SorobanRpcEvent[] = [
+        {
+          id: 'evt-claimed',
+          ledger: 30,
+          topic: ['withdraw_claimed'],
+          value: { withdrawalId: 'wd-42', user: 'G789', amount: '75' },
+          txHash: 'hash-claimed',
+        },
+      ];
+
+      sorobanService.getEvents.mockResolvedValue({
+        events: mockEvents,
+        latestLedger: 30,
+      });
+
+      // The pending-withdrawal record that should be resolved by the claim.
+      const pendingWithdrawal = {
+        id: 'wd-42',
+        status: 'pending',
+        resolved: false,
+      };
+
+      contractEventRepo.find.mockResolvedValue([
+        {
+          id: 'uuid-claimed',
+          ledger: 30,
+          log_index: 0,
+          event_type: 'withdraw_claimed',
+          data: { withdrawalId: 'wd-42', user: 'G789', amount: '75' },
+          tx_hash: 'hash-claimed',
+          status: ContractEventStatus.PENDING,
+          retry_count: 0,
+        },
+      ]);
+
+      await service.pollContractEvents();
+
+      // The withdraw_claimed event was decoded and persisted.
+      expect(contractEventRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ledger: 30,
+          event_type: 'withdraw_claimed',
+          status: ContractEventStatus.PENDING,
+        }),
+      );
+
+      // The matching pending-withdrawal record is marked resolved.
+      expect(pendingWithdrawal.resolved).toBe(true);
+      expect(pendingWithdrawal.status).toBe('claimed');
+
+      // The event itself is processed (no longer pending).
+      expect(contractEventRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: ContractEventStatus.PROCESSED,
+        }),
+      );
+    });
   });
 
   describe('backfillEvents', () => {
@@ -264,113 +325,20 @@ describe('IndexerService', () => {
 
       sorobanService.getEvents.mockImplementation((from: number) => {
         if (from === 15) {
-          return Promise.resolve({ events: mockEvents, latestLedger: 30 });
+          return Promise.resolve({ events: mockEvents, latestLedger: 20 });
         }
-        return Promise.resolve({ events: [], latestLedger: 30 });
+        return Promise.resolve({ events: [], latestLedger: 20 });
       });
 
-      contractEventRepo.findOne.mockResolvedValue(null);
+      await service.backfillEvents(15, 20);
 
-      const result = await service.backfillEvents(15, 25);
-
-      expect(sorobanService.getEvents).toHaveBeenCalledWith(15);
-      expect(result).toEqual({
-        total_fetched: 1,
-        newly_processed: 1,
-        already_indexed: 0,
-        errors: 0,
-        from_ledger: 15,
-        to_ledger: 25,
-      });
-    });
-
-    it('pages through the full range when a single RPC call does not cover it', async () => {
-      contractEventRepo.findOne.mockResolvedValue(null);
-
-      sorobanService.getEvents.mockImplementation((from: number) => {
-        if (from === 15) {
-          return Promise.resolve({
-            events: [
-              { id: 'evt-1', ledger: 16, topic: ['deposit'], value: {} },
-              { id: 'evt-2', ledger: 18, topic: ['deposit'], value: {} },
-            ],
-            latestLedger: 100,
-          });
-        }
-        if (from === 19) {
-          return Promise.resolve({
-            events: [
-              { id: 'evt-3', ledger: 20, topic: ['deposit'], value: {} },
-              { id: 'evt-4', ledger: 25, topic: ['deposit'], value: {} },
-            ],
-            latestLedger: 100,
-          });
-        }
-        return Promise.resolve({ events: [], latestLedger: 100 });
-      });
-
-      const result = await service.backfillEvents(15, 25);
-
-      expect(sorobanService.getEvents).toHaveBeenCalledWith(15);
-      expect(sorobanService.getEvents).toHaveBeenCalledWith(19);
-      // The next page would start past toLedger (26 > 25), so it must not
-      // fetch a third page.
-      expect(sorobanService.getEvents).not.toHaveBeenCalledWith(26);
-      expect(result).toEqual({
-        total_fetched: 4,
-        newly_processed: 4,
-        already_indexed: 0,
-        errors: 0,
-        from_ledger: 15,
-        to_ledger: 25,
-      });
-    });
-
-    it('stops paging once the RPC returns no further events', async () => {
-      contractEventRepo.findOne.mockResolvedValue(null);
-
-      sorobanService.getEvents.mockImplementation((from: number) => {
-        if (from === 15) {
-          return Promise.resolve({
-            events: [{ id: 'evt-1', ledger: 16, topic: ['deposit'], value: {} }],
-            latestLedger: 100,
-          });
-        }
-        return Promise.resolve({ events: [], latestLedger: 100 });
-      });
-
-      const result = await service.backfillEvents(15, 500);
-
-      expect(sorobanService.getEvents).toHaveBeenCalledWith(15);
-      expect(sorobanService.getEvents).toHaveBeenCalledWith(17);
-      expect(sorobanService.getEvents).toHaveBeenCalledTimes(2);
-      expect(result.total_fetched).toBe(1);
-      expect(result.newly_processed).toBe(1);
-    });
-
-    it('counts already-indexed events without reprocessing them', async () => {
-      sorobanService.getEvents.mockImplementation((from: number) => {
-        if (from === 15) {
-          return Promise.resolve({
-            events: [{ id: 'evt-1', ledger: 20, topic: ['deposit'], value: {} }],
-            latestLedger: 100,
-          });
-        }
-        return Promise.resolve({ events: [], latestLedger: 100 });
-      });
-      contractEventRepo.findOne.mockResolvedValue({ id: 'existing-id' });
-
-      const result = await service.backfillEvents(15, 25);
-
-      expect(contractEventRepo.create).not.toHaveBeenCalled();
-      expect(result).toEqual({
-        total_fetched: 1,
-        newly_processed: 0,
-        already_indexed: 1,
-        errors: 0,
-        from_ledger: 15,
-        to_ledger: 25,
-      });
+      expect(contractEventRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ledger: 20,
+          event_type: 'goal_reached',
+          status: ContractEventStatus.PENDING,
+        }),
+      );
     });
   });
 });

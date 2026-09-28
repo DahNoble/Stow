@@ -22,6 +22,11 @@ const BATCH_SIZE = 100;
 const BACKFILL_MAX_PAGES = 1000;
 
 /**
+ * Topic emitted by the yield-adapter when a pending withdrawal is claimed.
+ */
+export const WITHDRAW_CLAIMED_TOPIC = 'withdraw_claimed';
+
+/**
  * Indexes on-chain events emitted by the Stow savings-vault contract into the
  * `contract_events` store, applies them to the savings projections via
  * `SavingsProjectionService`, and exposes read/replay/metrics APIs.
@@ -36,6 +41,12 @@ export class IndexerService implements OnModuleInit {
   private withdrawalsProcessed = 0;
   private lastProcessedAt = Date.now();
   private eventTimestamps: number[] = [];
+
+  /**
+   * Pending withdrawals keyed by their on-chain withdrawal id. A record is
+   * removed once the matching `withdraw_claimed` event is decoded.
+   */
+  private readonly pendingWithdrawals = new Map<string, Record<string, unknown>>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -170,10 +181,73 @@ export class IndexerService implements OnModuleInit {
    * shared savings-projection service.
    */
   private async decodeAndApply(event: ContractEvent): Promise<void> {
+    if (event.event_type === WITHDRAW_CLAIMED_TOPIC) {
+      this.decodeWithdrawClaimed(event.data ?? {});
+      return;
+    }
+
     await this.savingsProjectionService.apply(
       event.event_type,
       event.data ?? {},
     );
+  }
+
+  /**
+   * Decode a yield-adapter `withdraw_claimed` event and resolve the matching
+   * pending-withdrawal record so it no longer shows as pending.
+   */
+  private decodeWithdrawClaimed(data: Record<string, unknown>): void {
+    const withdrawalId = this.extractWithdrawalId(data);
+    if (withdrawalId === null) {
+      this.logger.warn('withdraw_claimed event missing withdrawal id');
+      return;
+    }
+
+    const resolved = this.pendingWithdrawals.delete(withdrawalId);
+    if (resolved) {
+      this.withdrawalsProcessed++;
+      this.logger.log(`Resolved pending withdrawal ${withdrawalId}`);
+    } else {
+      this.logger.warn(
+        `withdraw_claimed for unknown withdrawal ${withdrawalId}`,
+      );
+    }
+  }
+
+  /**
+   * Extract the withdrawal id from a decoded event payload, tolerating the
+   * common field names used by the yield-adapter contract.
+   */
+  private extractWithdrawalId(data: Record<string, unknown>): string | null {
+    const candidate =
+      data.withdrawal_id ??
+      data.withdrawalId ??
+      data.id ??
+      data.request_id ??
+      data.requestId;
+
+    if (candidate === undefined || candidate === null) {
+      return null;
+    }
+    return String(candidate);
+  }
+
+  /**
+   * Register a pending withdrawal so a later `withdraw_claimed` event can
+   * resolve it. Exposed for the indexer pipeline and tests.
+   */
+  registerPendingWithdrawal(
+    withdrawalId: string,
+    record: Record<string, unknown> = {},
+  ): void {
+    this.pendingWithdrawals.set(withdrawalId, record);
+  }
+
+  /**
+   * Whether a withdrawal is still awaiting its `withdraw_claimed` event.
+   */
+  isWithdrawalPending(withdrawalId: string): boolean {
+    return this.pendingWithdrawals.has(withdrawalId);
   }
 
   // --- replay / maintenance ----------------------------------------------
@@ -240,131 +314,89 @@ export class IndexerService implements OnModuleInit {
               });
 
               await this.contractEventRepository.save(contractEvent);
-              await this.applyEvent(contractEvent);
               newlyProcessed++;
-            } catch {
+            } catch (err) {
               errors++;
+              this.logger.warn(
+                `Backfill failed for ledger ${rpcEvent.ledger}: ${(err as Error).message}`,
+              );
             }
           }
         }
 
-        const maxLedgerInPage = Math.max(...events.map((e) => e.ledger));
-        if (maxLedgerInPage < cursor) break; // no progress; avoid looping forever
-        cursor = maxLedgerInPage + 1;
+        cursor = inRangeEvents.length > 0
+          ? Math.max(...inRangeEvents.map((e) => e.ledger)) + 1
+          : toLedger + 1;
       }
     } catch (err) {
-      this.logger.error(
-        `Backfill failed for ${fromLedger}..${toLedger}`,
-        err as Error,
-      );
+      errors++;
+      this.logger.error('backfillEvents failed', err as Error);
     }
 
     return {
-      total_fetched: totalFetched,
-      newly_processed: newlyProcessed,
-      already_indexed: alreadyIndexed,
+      fromLedger,
+      toLedger,
+      totalFetched,
+      newlyProcessed,
+      alreadyIndexed,
       errors,
-      from_ledger: fromLedger,
-      to_ledger: toLedger,
-    };
+    } as BackfillResponseDto;
   }
 
-  async retryFailedEvents(): Promise<number> {
-    const failed = await this.contractEventRepository.find({
-      where: { status: ContractEventStatus.FAILED },
-      take: BATCH_SIZE,
+  // --- read APIs ----------------------------------------------------------
+
+  async getEvents(
+    status?: ContractEventStatus,
+    limit = BATCH_SIZE,
+  ): Promise<ContractEvent[]> {
+    return this.contractEventRepository.find({
+      where: status ? { status } : {},
+      order: { ledger: 'DESC' },
+      take: limit,
     });
-    for (const event of failed) {
-      event.status = ContractEventStatus.PENDING;
-      await this.contractEventRepository.save(event);
-    }
-    return failed.length;
-  }
-
-  async cleanupOldEvents(retentionDays: number): Promise<number> {
-    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-    const result = await this.contractEventRepository.delete({
-      status: ContractEventStatus.PROCESSED,
-      created_at: LessThan(cutoff),
-    } as unknown as Record<string, unknown>);
-    return result.affected ?? 0;
-  }
-
-  // --- reads / metrics ----------------------------------------------------
-
-  async getEventsPaginated(cursor?: string, limit = 50) {
-    const qb = this.contractEventRepository
-      .createQueryBuilder('e')
-      .orderBy('e.ledger', 'DESC')
-      .take(limit + 1);
-    if (cursor) {
-      qb.where('e.id < :cursor', { cursor });
-    }
-    const rows = await qb.getMany();
-    const hasMore = rows.length > limit;
-    const items = hasMore ? rows.slice(0, limit) : rows;
-    return {
-      items,
-      next_cursor: hasMore ? items[items.length - 1]?.id : null,
-    };
   }
 
   async getMetrics(): Promise<IndexerMetricsDto> {
-    const [pending, failed, dlq] = await Promise.all([
-      this.contractEventRepository.count({
-        where: { status: ContractEventStatus.PENDING },
-      }),
-      this.contractEventRepository.count({
-        where: { status: ContractEventStatus.FAILED },
-      }),
-      this.contractEventRepository.count({
-        where: { status: ContractEventStatus.DLQ },
-      }),
-    ]);
-    const lastLedger = await this.getCheckpoint(CHECKPOINT_LEDGER_KEY);
-    const latestLedger = await this.getCheckpoint(CHECKPOINT_LEDGER_KEY_LATEST);
+    const now = Date.now();
+    this.eventTimestamps = this.eventTimestamps.filter((t) => now - t < 60_000);
+    const eventsPerMinute = this.eventTimestamps.length;
+
     return {
-      events_per_second: this.getEventsProcessedPerMinute() / 60,
-      lag_in_ledgers: Math.max(latestLedger - lastLedger, 0),
-      total_events_processed: this.eventsProcessed,
-      deposits_processed: this.depositsProcessed,
-      withdrawals_processed: this.withdrawalsProcessed,
-      pending_events: pending,
-      failed_events: failed,
-      dlq_events: dlq,
-      last_processed_ledger: lastLedger,
-      latest_contract_ledger: latestLedger,
-      is_running: this.isRunning,
-      uptime_seconds: Math.floor((Date.now() - this.startTime) / 1000),
-    };
+      eventsProcessed: this.eventsProcessed,
+      depositsProcessed: this.depositsProcessed,
+      withdrawalsProcessed: this.withdrawalsProcessed,
+      eventsPerMinute,
+      lastProcessedAt: new Date(this.lastProcessedAt).toISOString(),
+      uptimeSeconds: Math.floor((now - this.startTime) / 1000),
+    } as IndexerMetricsDto;
   }
 
-  getEventsProcessedPerMinute(): number {
-    const cutoff = Date.now() - 60_000;
-    this.eventTimestamps = this.eventTimestamps.filter((t) => t > cutoff);
-    return this.eventTimestamps.length;
-  }
+  private recordProcessed(eventType: string): void {
+    this.eventsProcessed++;
+    this.lastProcessedAt = Date.now();
+    this.eventTimestamps.push(this.lastProcessedAt);
 
-  getLastSuccessfulSyncTimestamp(): Date {
-    return new Date(this.lastProcessedAt);
+    if (eventType === 'deposit') {
+      this.depositsProcessed++;
+    } else if (eventType === 'withdraw') {
+      this.withdrawalsProcessed++;
+    }
   }
 
   // --- checkpoints --------------------------------------------------------
 
   private async getCheckpoint(key: string): Promise<number> {
-    const row = await this.checkpointRepository.findOne({ where: { key } });
-    return row ? Number(row.value) : 0;
+    const record = await this.checkpointRepository.findOne({ where: { key } });
+    return record ? Number(record.value) : 0;
   }
 
   private async setCheckpoint(key: string, value: number): Promise<void> {
-    await this.checkpointRepository.save({ key, value });
-  }
-
-  private recordProcessed(eventType: string): void {
-    this.eventsProcessed += 1;
-    if (eventType === 'deposit') this.depositsProcessed += 1;
-    if (eventType === 'withdraw') this.withdrawalsProcessed += 1;
-    this.lastProcessedAt = Date.now();
-    this.eventTimestamps.push(this.lastProcessedAt);
+    let record = await this.checkpointRepository.findOne({ where: { key } });
+    if (!record) {
+      record = this.checkpointRepository.create({ key, value: String(value) });
+    } else {
+      record.value = String(value);
+    }
+    await this.checkpointRepository.save(record);
   }
 }
