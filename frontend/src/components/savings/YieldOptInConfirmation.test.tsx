@@ -10,16 +10,18 @@ const mockFeeDisclosure = {
 };
 
 describe("YieldOptInConfirmation", () => {
-  it("renders title and APR information", () => {
+  it("renders title, amount and APR information", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
       />,
     );
     expect(screen.getByText("Enable Yield")).toBeInTheDocument();
+    expect(screen.getByText("100 USDC")).toBeInTheDocument();
     expect(screen.getByText("5.5%")).toBeInTheDocument();
   });
 
@@ -27,6 +29,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -42,6 +45,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -60,6 +64,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={onConfirm}
         onCancel={vi.fn()}
@@ -77,6 +82,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={onCancel}
@@ -95,6 +101,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={onConfirm}
         onCancel={onCancel}
@@ -120,6 +127,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -134,6 +142,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={{
           performanceFeeBps: 2000,
           isLoading: true,
@@ -150,6 +159,7 @@ describe("YieldOptInConfirmation", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={{
           performanceFeeBps: 0,
           isLoading: false,
@@ -168,6 +178,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     const { container } = render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -180,6 +191,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -193,6 +205,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -206,6 +219,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -223,6 +237,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
@@ -238,6 +253,7 @@ describe("YieldOptInConfirmation accessibility", () => {
     const { container } = render(
       <YieldOptInConfirmation
         apr={5.5}
+        amount="100"
         feeDisclosure={mockFeeDisclosure}
         onConfirm={vi.fn()}
         onCancel={vi.fn()}
