@@ -527,9 +527,127 @@ fn register_strategy_rejects_duplicate_address() {
 }
 
 #[test]
-#[ignore = "TODO(issue): implement admin::set_paused narrower blocklist"]
+#[ignore = "blocked on withdraw::request_withdraw + withdraw::claim_withdraw (still unimplemented!())"]
 fn paused_blocks_mutations_but_not_claim_withdraw() {
-    todo!("pause, assert deposit/request_withdraw/harvest all reject with Error::Paused, then assert an in-flight claim_withdraw still succeeds");
+    use crate::types::{Position, WithdrawRequest};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let request_id = 1u64;
+    let now = env.ledger().timestamp();
+
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+
+    // Register a strategy while unpaused so the id-taking strategy mutations
+    // below have something real to point at.
+    let strategy_address = setup_mock_strategy(&env);
+    let strategy_id = client.register_strategy(
+        &admin,
+        &strategy_address,
+        &soroban_sdk::String::from_str(&env, "mock"),
+    );
+
+    // `request_withdraw` is a separate, still-unimplemented issue, so seed
+    // the in-flight state it would have left behind: an owner position
+    // already debited by the burned shares, a past-cooldown
+    // `WithdrawRequest` whose `shares` field holds the fixed asset amount,
+    // and enough idle tokens in the adapter to pay it out without touching
+    // the strategy.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &600i128);
+        env.storage().persistent().set(
+            &DataKey::Position(owner.clone()),
+            &Position {
+                owner: owner.clone(),
+                shares: 600,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::WithdrawRequest(request_id),
+            &WithdrawRequest {
+                id: request_id,
+                owner: owner.clone(),
+                shares: 400,
+                claimable_at: now,
+                requested_at: now,
+                claimed_at: None,
+                cancelled_at: None,
+            },
+        );
+    });
+    token_admin.mint(&client.address, &1_000);
+    token_admin.mint(&owner, &500);
+
+    client.set_paused(&admin, &true);
+    assert!(client.is_paused());
+
+    // --- every mutating entrypoint rejects with Error::Paused ---
+    assert_eq!(
+        client.try_deposit(&owner, &100),
+        Err(Ok(Error::Paused)),
+        "deposit must reject while paused",
+    );
+    assert_eq!(
+        client.try_request_withdraw(&owner, &100),
+        Err(Ok(Error::Paused)),
+        "request_withdraw must reject while paused",
+    );
+    assert_eq!(
+        client.try_harvest(&admin),
+        Err(Ok(Error::Paused)),
+        "harvest must reject while paused",
+    );
+    assert_eq!(
+        client.try_register_strategy(
+            &admin,
+            &setup_mock_strategy(&env),
+            &soroban_sdk::String::from_str(&env, "mock-2"),
+        ),
+        Err(Ok(Error::Paused)),
+        "register_strategy must reject while paused",
+    );
+    assert_eq!(
+        client.try_set_active_strategy(&admin, &strategy_id),
+        Err(Ok(Error::Paused)),
+        "set_active_strategy must reject while paused",
+    );
+    assert_eq!(
+        client.try_migrate_strategy(&admin, &strategy_id),
+        Err(Ok(Error::Paused)),
+        "migrate_strategy must reject while paused",
+    );
+    assert_eq!(
+        client.try_deregister_strategy(&admin, &strategy_id),
+        Err(Ok(Error::Paused)),
+        "deregister_strategy must reject while paused",
+    );
+
+    // The rejected calls must not have moved any state.
+    assert_eq!(client.total_shares(), 600);
+    assert_eq!(client.get_position(&owner).shares, 600);
+    assert_eq!(token_client.balance(&owner), 500);
+    assert_eq!(client.list_strategies().len(), 1);
+
+    // --- reads stay available ---
+    assert_eq!(client.get_withdraw_request(&request_id).shares, 400);
+
+    // --- the in-flight claim still goes through ---
+    let payout = client.claim_withdraw(&owner, &request_id);
+    assert_eq!(payout, 400, "claim must pay the asset amount fixed at request time");
+    assert_eq!(token_client.balance(&owner), 900);
+    assert!(client.get_withdraw_request(&request_id).claimed_at.is_some());
+
+    // Unpausing restores mutations.
+    client.set_paused(&admin, &false);
+    assert!(!client.is_paused());
+    assert!(client.try_deposit(&owner, &100).is_ok());
 }
 
 #[test]
@@ -539,11 +657,46 @@ fn initialize_twice_rejected() {
     let (client, admin, treasury, token) = setup_with_token(&env);
 
     let second_admin = Address::generate(&env);
-    let result = client.try_initialize(&second_admin, &treasury, &token);
-    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    let second_treasury = Address::generate(&env);
+    let second_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
 
-    // The original values must survive the rejected re-initialization.
+    // Re-running with identical arguments is rejected just the same —
+    // "exactly once" is about the call, not the values.
+    assert_eq!(
+        client.try_initialize(&admin, &treasury, &token),
+        Err(Ok(Error::AlreadyInitialized)),
+    );
+
+    // An attempt to overwrite any one of the configured addresses is rejected.
+    assert_eq!(
+        client.try_initialize(&second_admin, &treasury, &token),
+        Err(Ok(Error::AlreadyInitialized)),
+    );
+    assert_eq!(
+        client.try_initialize(&admin, &second_treasury, &token),
+        Err(Ok(Error::AlreadyInitialized)),
+    );
+    assert_eq!(
+        client.try_initialize(&admin, &treasury, &second_token),
+        Err(Ok(Error::AlreadyInitialized)),
+    );
+
+    // Overwriting everything at once is rejected, and keeps being rejected.
+    for _ in 0..3 {
+        assert_eq!(
+            client.try_initialize(&second_admin, &second_treasury, &second_token),
+            Err(Ok(Error::AlreadyInitialized)),
+        );
+    }
+
+    // The original values must survive every rejected re-initialization.
     assert_eq!(client.admin(), admin);
+    assert_eq!(client.treasury(), treasury);
+    assert_eq!(client.token(), token);
+    assert_eq!(client.total_shares(), 0);
+    assert_eq!(client.fees_accrued(), 0);
 }
 
 // ---------------------------------------------------------------------------
