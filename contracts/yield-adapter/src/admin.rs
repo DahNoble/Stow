@@ -123,6 +123,36 @@ pub fn set_performance_fee_bps(env: &Env, caller: Address, bps: u32) -> Result<(
     Ok(())
 }
 
+/// Minimum number of seconds between successful `harvest` calls. Defaults
+/// to `0` (no minimum) if unset. See `harvest::check_harvest_interval`.
+pub fn harvest_interval(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::HarvestInterval)
+        .unwrap_or(0)
+}
+
+/// Set the minimum interval between `harvest` calls. Admin-only. Mirrors
+/// `set_withdraw_cooldown`'s shape.
+///
+/// - Requires `require_auth` from the current admin.
+/// - Takes effect on the very next `check_harvest_interval` call.
+pub fn set_harvest_interval(env: &Env, caller: Address, seconds: u64) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = storage::get_admin(env).ok_or(Error::NotInitialized)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::HarvestInterval, &seconds);
+
+    Ok(())
+}
+
 /// Set the emergency-pause flag. Admin-only.
 ///
 /// While paused, `deposit`, `request_withdraw`, `harvest`, and strategy

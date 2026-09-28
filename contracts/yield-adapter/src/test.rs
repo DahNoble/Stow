@@ -16,6 +16,7 @@ use soroban_sdk::{
 };
 
 use crate::error::Error;
+use crate::types::DataKey;
 use crate::{YieldAdapter, YieldAdapterClient};
 
 // ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ fn setup_mock_strategy(env: &Env) -> Address {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn setup(env: &Env) -> YieldAdapterClient {
+fn setup(env: &Env) -> YieldAdapterClient<'_> {
     let contract_id = env.register(YieldAdapter, ());
     YieldAdapterClient::new(env, &contract_id)
 }
@@ -40,7 +41,7 @@ fn setup(env: &Env) -> YieldAdapterClient {
 /// Full setup: adapter + SEP-41 mock token + admin + treasury.
 ///
 /// Returns `(client, admin, treasury, token_address)`.
-fn setup_with_token(env: &Env) -> (YieldAdapterClient, Address, Address, Address) {
+fn setup_with_token(env: &Env) -> (YieldAdapterClient<'_>, Address, Address, Address) {
     let client = setup(env);
     let admin = Address::generate(env);
     let treasury = Address::generate(env);
@@ -52,6 +53,224 @@ fn setup_with_token(env: &Env) -> (YieldAdapterClient, Address, Address, Address
     client.initialize(&admin, &treasury, &token_address);
 
     (client, admin, treasury, token_address)
+}
+
+// ---------------------------------------------------------------------------
+// Pure-logic unit tests — no `Env`/contract needed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_fee_bps_boundary() {
+    assert!(crate::fees::validate_fee_bps(crate::fees::MAX_PERFORMANCE_FEE_BPS).is_ok());
+    assert_eq!(
+        crate::fees::validate_fee_bps(crate::fees::MAX_PERFORMANCE_FEE_BPS + 1),
+        Err(Error::FeeTooHigh),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct unit tests — `harvest::apply_performance_fee` and
+// `harvest::check_harvest_interval` exercised directly (not through the
+// `harvest` entrypoint).
+//
+// `harvest` itself, and thus the end-to-end
+// `performance_fee_taken_only_on_positive_yield` /
+// `loss_reduces_exchange_rate_without_charging_fee` acceptance tests below,
+// need a mock strategy contract that doesn't exist yet (see the module doc
+// above) and are covered by a separate, unassigned issue. These tests give
+// `apply_performance_fee` and `check_harvest_interval` real coverage in the
+// meantime using `env.as_contract` to reach contract storage without going
+// through `harvest`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn apply_performance_fee_credits_fees_accrued_and_returns_remainder() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceFeeBps, &1_000u32); // 10%
+
+        let remainder = crate::harvest::apply_performance_fee(&env, 1_000).unwrap();
+
+        assert_eq!(remainder, 900);
+        let fees_accrued: i128 = env.storage().instance().get(&DataKey::FeesAccrued).unwrap();
+        assert_eq!(fees_accrued, 100);
+    });
+}
+
+#[test]
+fn apply_performance_fee_accumulates_across_calls() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::PerformanceFeeBps, &500u32); // 5%
+
+        crate::harvest::apply_performance_fee(&env, 2_000).unwrap();
+        crate::harvest::apply_performance_fee(&env, 4_000).unwrap();
+
+        let fees_accrued: i128 = env.storage().instance().get(&DataKey::FeesAccrued).unwrap();
+        // 2_000 * 500 / 10_000 = 100; 4_000 * 500 / 10_000 = 200.
+        assert_eq!(fees_accrued, 300);
+    });
+}
+
+#[test]
+fn apply_performance_fee_zero_bps_credits_nothing() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        // `PerformanceFeeBps` left unset — defaults to 0 per `admin::performance_fee_bps`.
+        let remainder = crate::harvest::apply_performance_fee(&env, 5_000).unwrap();
+
+        assert_eq!(remainder, 5_000);
+        let fees_accrued: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeesAccrued)
+            .unwrap_or(0);
+        assert_eq!(fees_accrued, 0);
+    });
+}
+
+#[test]
+fn check_harvest_interval_default_allows_immediate_harvest() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    env.as_contract(&contract_id, || {
+        // No `HarvestInterval` / `LastHarvestAt` set — first-ever harvest must
+        // never be blocked.
+        assert!(crate::harvest::check_harvest_interval(&env).is_ok());
+    });
+}
+
+#[test]
+fn check_harvest_interval_rejects_too_soon() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    let start: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: start,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::HarvestInterval, &3_600u64); // 1 hour
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHarvestAt, &start);
+
+        // Not enough time has elapsed yet.
+        env.ledger().set(LedgerInfo {
+            timestamp: start + 1_800, // 30 minutes later
+            protocol_version: 22,
+            sequence_number: 200,
+            network_id: Default::default(),
+            base_reserve: 5_000_000,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 3_110_400,
+        });
+        assert_eq!(
+            crate::harvest::check_harvest_interval(&env),
+            Err(Error::HarvestTooSoon),
+        );
+    });
+}
+
+#[test]
+fn check_harvest_interval_allows_after_elapsed() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+
+    let start: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: start,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::HarvestInterval, &3_600u64); // 1 hour
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHarvestAt, &start);
+
+        // A full hour (plus one second) has elapsed.
+        env.ledger().set(LedgerInfo {
+            timestamp: start + 3_601,
+            protocol_version: 22,
+            sequence_number: 300,
+            network_id: Default::default(),
+            base_reserve: 5_000_000,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 3_110_400,
+        });
+        assert!(crate::harvest::check_harvest_interval(&env).is_ok());
+    });
+}
+
+#[test]
+fn set_and_get_harvest_interval_mirrors_withdraw_cooldown_shape() {
+    // `admin::initialize` is unimplemented (a separate, unassigned issue), so
+    // this seeds `DataKey::Admin` directly rather than going through
+    // `client.initialize(..)`.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(YieldAdapter, ());
+    let client = YieldAdapterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    assert_eq!(client.harvest_interval(), 0);
+
+    client.set_harvest_interval(&admin, &7_200u64);
+    assert_eq!(client.harvest_interval(), 7_200);
+}
+
+#[test]
+fn set_harvest_interval_rejects_non_admin_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(YieldAdapter, ());
+    let client = YieldAdapterClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let impostor = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    });
+
+    let result = client.try_set_harvest_interval(&impostor, &7_200u64);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.harvest_interval(), 0);
 }
 
 // ---------------------------------------------------------------------------
