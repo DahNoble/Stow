@@ -13,6 +13,8 @@ export type {
   SavingsListRowSkeletonProps,
   SavingsListSkeletonProps,
 } from "./SavingsListRowSkeleton";
+export { default as LockedPlanCountdown } from "./LockedPlanCountdown";
+export type { LockedPlanCountdownProps } from "./LockedPlanCountdown";
 export { default as GoalCard } from "./GoalCard";
 export type { GoalCardGoal, GoalCardProps } from "./GoalCard";
 export { default as YieldOptInCard } from "./YieldOptInCard";
