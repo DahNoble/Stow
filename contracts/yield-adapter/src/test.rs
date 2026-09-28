@@ -470,10 +470,229 @@ fn loss_reduces_exchange_rate_without_charging_fee() {
     todo!("harvest a negative-yield report, assert exchange_rate() decreased and fees_accrued() unchanged");
 }
 
+// ---------------------------------------------------------------------------
+// Auth review — unauthorized access rejected across mutating entrypoints
+// ---------------------------------------------------------------------------
+//
+// Covers every mutating entrypoint implemented today. Still stubbed with
+// `unimplemented!()`, so not exercisable yet: `set_admin`, `set_treasury`,
+// `set_withdraw_cooldown`, `upgrade`, `set_strategy_deposit_cap`,
+// `request_withdraw`, `claim_withdraw` — add a case to both tests below as
+// each one lands.
+
+/// Adapter with two registered strategies (the first one active) and a
+/// pending withdraw request (id `1`) owned by `owner`.
+///
+/// Returns `(client, admin, token, owner, active_id, standby_id)`.
+fn setup_auth_harness(env: &Env) -> (YieldAdapterClient, Address, Address, Address, u64, u64) {
+    use crate::types::{DataKey, Position, WithdrawRequest};
+
+    let (client, admin, _treasury, token) = setup_with_token(env);
+    let active_id = client.register_strategy(
+        &admin,
+        &setup_mock_strategy(env),
+        &soroban_sdk::String::from_str(env, "active"),
+    );
+    let standby_id = client.register_strategy(
+        &admin,
+        &setup_mock_strategy(env),
+        &soroban_sdk::String::from_str(env, "standby"),
+    );
+    client.set_active_strategy(&admin, &active_id);
+
+    // `request_withdraw` is still a stub — seed the state it would leave
+    // behind, same shape as `cancel_withdraw_returns_shares_to_owner`.
+    let owner = Address::generate(env);
+    let now = env.ledger().timestamp();
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &600i128);
+        env.storage().persistent().set(
+            &DataKey::Position(owner.clone()),
+            &Position {
+                owner: owner.clone(),
+                shares: 600,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::WithdrawRequest(1),
+            &WithdrawRequest {
+                id: 1,
+                owner: owner.clone(),
+                shares: 400,
+                claimable_at: now,
+                requested_at: now,
+                claimed_at: None,
+                cancelled_at: None,
+            },
+        );
+    });
+    soroban_sdk::token::StellarAssetClient::new(env, &token).mint(&client.address, &600);
+
+    (client, admin, token, owner, active_id, standby_id)
+}
+
+fn active_strategy_id(env: &Env, client: &YieldAdapterClient) -> Option<u64> {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .get(&crate::types::DataKey::ActiveStrategy)
+    })
+}
+
+fn withdraw_request_cancelled(env: &Env, client: &YieldAdapterClient, request_id: u64) -> bool {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get::<_, crate::types::WithdrawRequest>(&crate::types::DataKey::WithdrawRequest(
+                request_id,
+            ))
+            .unwrap()
+            .cancelled_at
+            .is_some()
+    })
+}
+
+/// Assert none of the calls rejected in the tests below left state behind.
+fn assert_auth_harness_untouched(
+    env: &Env,
+    client: &YieldAdapterClient,
+    active_id: u64,
+    standby_id: u64,
+) {
+    assert_eq!(client.performance_fee_bps(), 0);
+    assert!(!client.is_paused());
+    assert_eq!(client.list_strategies().len(), 2);
+    assert!(client.get_strategy(&standby_id).deregistered_at.is_none());
+    assert_eq!(active_strategy_id(env, client), Some(active_id));
+    assert!(!withdraw_request_cancelled(env, client, 1));
+    assert_eq!(client.total_shares(), 600);
+}
+
+/// A caller who signs *as themselves* but is not the admin (or, for
+/// `cancel_withdraw`, not the request's owner) is rejected with
+/// `Error::Unauthorized` — a valid signature is not a substitute for being
+/// the right account.
 #[test]
-#[ignore = "TODO(issue): auth review — require_auth on all mutating entrypoints"]
 fn unauthorized_access_rejected() {
-    todo!("for each mutating entrypoint, call without the required signer's auth and assert rejection");
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token, _owner, active_id, standby_id) = setup_auth_harness(&env);
+    let stranger = Address::generate(&env);
+    let rogue_strategy = setup_mock_strategy(&env);
+
+    assert_eq!(
+        client.try_set_performance_fee_bps(&stranger, &1_000),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_set_paused(&stranger, &true),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_register_strategy(
+            &stranger,
+            &rogue_strategy,
+            &soroban_sdk::String::from_str(&env, "rogue"),
+        ),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_deregister_strategy(&stranger, &standby_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_set_active_strategy(&stranger, &standby_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_migrate_strategy(&stranger, &standby_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_emergency_withdraw_all(&stranger),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(
+        client.try_cancel_withdraw(&stranger, &1),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    assert_auth_harness_untouched(&env, &client, active_id, standby_id);
+}
+
+/// Passing the *right* address (admin / position owner) without that
+/// account's signature is rejected by the host's auth check before any
+/// state is touched.
+#[test]
+fn mutating_entrypoints_reject_missing_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, owner, active_id, standby_id) = setup_auth_harness(&env);
+    let rogue_strategy = setup_mock_strategy(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&owner, &100);
+
+    // From here on, no signature is mocked for anyone.
+    env.mock_auths(&[]);
+
+    macro_rules! assert_auth_rejected {
+        ($call:expr) => {
+            assert!(
+                matches!($call, Err(Err(_))),
+                "`{}` must be rejected without the signer's auth",
+                stringify!($call)
+            );
+        };
+    }
+
+    assert_auth_rejected!(client.try_set_performance_fee_bps(&admin, &1_000));
+    assert_auth_rejected!(client.try_set_paused(&admin, &true));
+    assert_auth_rejected!(client.try_register_strategy(
+        &admin,
+        &rogue_strategy,
+        &soroban_sdk::String::from_str(&env, "rogue"),
+    ));
+    assert_auth_rejected!(client.try_deregister_strategy(&admin, &standby_id));
+    assert_auth_rejected!(client.try_set_active_strategy(&admin, &standby_id));
+    assert_auth_rejected!(client.try_migrate_strategy(&admin, &standby_id));
+    assert_auth_rejected!(client.try_emergency_withdraw_all(&admin));
+    assert_auth_rejected!(client.try_deposit(&owner, &100));
+    assert_auth_rejected!(client.try_cancel_withdraw(&owner, &1));
+
+    assert_auth_harness_untouched(&env, &client, active_id, standby_id);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&env, &token).balance(&owner),
+        100,
+        "a rejected deposit must not pull the owner's tokens"
+    );
+}
+
+/// `harvest` and `withdraw_fees` are permissionless by design (see their doc
+/// comments) — they must keep working with no signature at all, so the auth
+/// review above doesn't accidentally lock keepers out.
+#[test]
+fn permissionless_entrypoints_need_no_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token, _owner, active_id, _standby_id) = setup_auth_harness(&env);
+    client.set_performance_fee_bps(&admin, &1_000); // 10%
+    let strategy_address = client.get_strategy(&active_id).address;
+    MockStrategyClient::new(&env, &strategy_address)
+        .set_reported_balance(&client.address, &1_000_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&client.address, &100_000);
+
+    env.mock_auths(&[]);
+    let keeper = Address::generate(&env);
+
+    assert_eq!(client.harvest(&keeper), 1_000_000);
+    assert_eq!(client.withdraw_fees(&keeper), 100_000);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&env, &token).balance(&client.treasury()),
+        100_000
+    );
 }
 
 #[test]
@@ -500,10 +719,237 @@ fn strategy_migration_preserves_total_assets() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Property test — share/asset rounding never allows value extraction
+// ---------------------------------------------------------------------------
+//
+// Driven through `proptest::test_runner::TestRunner` directly rather than the
+// `proptest!` macro, and asserting with plain `assert!`: this crate is
+// `#![no_std]`, and the macros' expansions lean on `std`/`format!` being in
+// scope. A panicking case is still caught, shrunk, and reported by the runner.
+
+const PROPTEST_CASES: u32 = 64;
+
+fn shares_of(client: &YieldAdapterClient, owner: &Address) -> i128 {
+    client
+        .try_get_position(owner)
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|p| p.shares)
+        .unwrap_or(0)
+}
+
+/// What `shares` would redeem for at the current exchange rate.
+fn redeemable(env: &Env, client: &YieldAdapterClient, shares: i128) -> i128 {
+    if shares <= 0 {
+        return 0;
+    }
+    env.as_contract(&client.address, || {
+        crate::accounting::convert_to_assets(env, shares).unwrap()
+    })
+}
+
+/// Stand-in for `request_withdraw` + `claim_withdraw` (both still stubs),
+/// following their doc comments: the payout is fixed with `convert_to_assets`
+/// *before* the shares are burned, then paid out of the adapter's idle
+/// balance. Swap this for the real entrypoints once they land.
+fn simulate_withdraw(env: &Env, client: &YieldAdapterClient, owner: &Address, shares: i128) -> i128 {
+    use crate::types::{DataKey, Position};
+
+    env.as_contract(&client.address, || {
+        let payout = crate::accounting::convert_to_assets(env, shares).unwrap();
+
+        let key = DataKey::Position(owner.clone());
+        let mut position: Position = env.storage().persistent().get(&key).unwrap();
+        position.shares -= shares;
+        env.storage().persistent().set(&key, &position);
+        let total_shares = crate::accounting::total_shares(env);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &(total_shares - shares));
+
+        if payout > 0 {
+            crate::storage::transfer_out(env, owner, payout).unwrap();
+        }
+        payout
+    })
+}
+
+/// Single deposit at an arbitrary pre-existing exchange rate: the depositor
+/// can never redeem more than they put in, and existing holders are never
+/// diluted by the deposit's rounding.
 #[test]
-#[ignore = "TODO(issue): property test — share/asset rounding never allows value extraction"]
+fn deposit_rounding_never_favors_the_depositor() {
+    use proptest::test_runner::{Config, TestRunner};
+
+    let mut runner = TestRunner::new(Config::with_cases(PROPTEST_CASES));
+    let rate_and_amount = (
+        1i128..=1_000_000_000_000, // total_assets already in the vault
+        1i128..=1_000_000_000_000, // total_shares already outstanding
+        1i128..=1_000_000_000_000, // deposit amount
+    );
+
+    runner
+        .run(&rate_and_amount, |(total_assets, total_shares, amount)| {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+            let (client, _admin, _treasury, token) = setup_with_token(&env);
+            let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+            // Existing holders' shares are tracked only through the
+            // `TotalShares` running total — no one depositor is needed to
+            // establish the rate.
+            env.as_contract(&client.address, || {
+                env.storage()
+                    .instance()
+                    .set(&crate::types::DataKey::TotalShares, &total_shares);
+            });
+            token_admin.mint(&client.address, &total_assets);
+
+            let user = Address::generate(&env);
+            token_admin.mint(&user, &amount);
+            let minted = client.deposit(&user, &amount);
+
+            let round_trip = redeemable(&env, &client, minted);
+            assert!(
+                round_trip <= amount,
+                "deposit {} at rate {}/{} minted {} shares redeemable for {}",
+                amount,
+                total_assets,
+                total_shares,
+                minted,
+                round_trip
+            );
+            let existing = redeemable(&env, &client, total_shares);
+            assert!(
+                existing >= total_assets,
+                "deposit {} at rate {}/{} diluted existing holders to {}",
+                amount,
+                total_assets,
+                total_shares,
+                existing
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Arbitrary interleavings of deposits, (partial) withdrawals, and external
+/// yield across three depositors. Checks, after every step, that the acting
+/// depositor's rounding never took value from anyone else; and at the end,
+/// once everyone has exited, that nobody was paid more than they deposited
+/// plus the yield that flowed in.
+#[test]
 fn share_rounding_never_allows_value_extraction() {
-    todo!("proptest: for arbitrary sequences of deposit/request_withdraw/claim_withdraw, assert sum of payouts never exceeds sum of deposits plus harvested yield");
+    use proptest::test_runner::{Config, TestRunner};
+
+    const DEPOSIT: u8 = 0;
+    const WITHDRAW: u8 = 1;
+    // Any other op kind: external yield lands in the adapter.
+
+    let mut runner = TestRunner::new(Config::with_cases(PROPTEST_CASES));
+    let ops = proptest::collection::vec(
+        (
+            0u8..3,                     // op kind
+            0usize..3,                  // acting depositor
+            1i128..=1_000_000_000,      // amount (deposit / yield)
+            proptest::bool::ANY,        // shrink amount to 1..=16, to hit rounding edges
+            1i128..=10_000,             // withdraw fraction of position, in bps
+        ),
+        1..32,
+    );
+
+    runner
+        .run(&ops, |ops| {
+            let env = Env::default();
+            env.mock_all_auths_allowing_non_root_auth();
+            let (client, _admin, _treasury, token) = setup_with_token(&env);
+            let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+
+            let users = [
+                Address::generate(&env),
+                Address::generate(&env),
+                Address::generate(&env),
+            ];
+            let values = |client: &YieldAdapterClient| -> [i128; 3] {
+                [0, 1, 2].map(|i| redeemable(&env, client, shares_of(client, &users[i])))
+            };
+
+            let mut deposited = [0i128; 3];
+            let mut paid_out = [0i128; 3];
+            let mut total_yield = 0i128;
+
+            for (kind, actor, raw_amount, small, withdraw_bps) in ops {
+                let amount = if small { raw_amount % 16 + 1 } else { raw_amount };
+                let before = values(&client);
+
+                match kind {
+                    DEPOSIT => {
+                        token_admin.mint(&users[actor], &amount);
+                        client.deposit(&users[actor], &amount);
+                        deposited[actor] += amount;
+                    }
+                    WITHDRAW => {
+                        let shares = shares_of(&client, &users[actor]) * withdraw_bps / 10_000;
+                        if shares == 0 {
+                            continue;
+                        }
+                        paid_out[actor] += simulate_withdraw(&env, &client, &users[actor], shares);
+                    }
+                    _ => {
+                        token_admin.mint(&client.address, &amount);
+                        total_yield += amount;
+                    }
+                }
+
+                let after = values(&client);
+                for other in 0..3 {
+                    if other == actor {
+                        continue;
+                    }
+                    assert!(
+                        after[other] >= before[other],
+                        "op kind {} by depositor {} (amount {}) cut depositor {}'s value from {} to {}",
+                        kind,
+                        actor,
+                        amount,
+                        other,
+                        before[other],
+                        after[other]
+                    );
+                }
+            }
+
+            // Everyone exits.
+            for (i, user) in users.iter().enumerate() {
+                let shares = shares_of(&client, user);
+                if shares > 0 {
+                    paid_out[i] += simulate_withdraw(&env, &client, user, shares);
+                }
+            }
+
+            let total_deposited: i128 = deposited.iter().sum();
+            let total_paid: i128 = paid_out.iter().sum();
+            assert!(
+                total_paid <= total_deposited + total_yield,
+                "paid out {} against {} deposited + {} yield",
+                total_paid,
+                total_deposited,
+                total_yield
+            );
+            for i in 0..3 {
+                assert!(
+                    paid_out[i] <= deposited[i] + total_yield,
+                    "depositor {} was paid {} against {} deposited + {} total yield",
+                    i,
+                    paid_out[i],
+                    deposited[i],
+                    total_yield
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
