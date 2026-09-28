@@ -304,6 +304,55 @@ fn admin_treasury_token_error_before_initialize() {
 }
 
 #[test]
+fn set_admin_rotates_admin_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury, _token) = setup_with_token(&env);
+    let new_admin = Address::generate(&env);
+
+    client.set_admin(&new_admin);
+
+    assert_eq!(client.admin(), new_admin);
+
+    let now = env.ledger().timestamp();
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.last().unwrap().clone();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (crate::events::TOPIC_ADMIN_SET,).into_val(&env);
+    let decoded: (Address, Address, u64) =
+        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+
+    assert_eq!(contract_id, client.address);
+    assert_eq!(topics, expected_topics);
+    assert_eq!(decoded, (admin, new_admin, now));
+}
+
+#[test]
+fn set_admin_without_admin_auth_rejected() {
+    let env = Env::default();
+    let (client, _admin, _treasury, _token) = setup_with_token(&env);
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_set_admin(&new_admin);
+
+    assert!(
+        result.is_err(),
+        "set_admin must fail without the current admin's authorization",
+    );
+}
+
+#[test]
+fn set_admin_before_initialize_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let new_admin = Address::generate(&env);
+
+    let result = client.try_set_admin(&new_admin);
+    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
 fn deposit_mints_shares_proportional_to_exchange_rate() {
     let env = Env::default();
     env.mock_all_auths();

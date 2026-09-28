@@ -3,7 +3,9 @@
 use soroban_sdk::{Address, BytesN, Env};
 
 use crate::error::Error;
-use crate::events::{EVENT_SCHEMA_VERSION, TOPIC_INIT, TOPIC_PAUSED_CHANGED};
+use crate::events::{
+    EVENT_SCHEMA_VERSION, TOPIC_ADMIN_SET, TOPIC_INIT, TOPIC_PAUSED_CHANGED,
+};
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::DataKey;
 
@@ -74,10 +76,21 @@ pub fn token(env: &Env) -> Result<Address, Error> {
 
 /// Rotate the admin. Requires `require_auth` from the current admin.
 ///
-/// TODO(issue): implement — mirrors `savings-vault::admin::set_admin`. Emit
-/// `admin_set`.
-pub fn set_admin(_env: &Env, _new_admin: Address) -> Result<(), Error> {
-    unimplemented!("admin: set_admin")
+/// Emits `admin_set`.
+pub fn set_admin(env: &Env, new_admin: Address) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    current_admin.require_auth();
+
+    env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+    env.events().publish(
+        (TOPIC_ADMIN_SET,),
+        (current_admin, new_admin, env.ledger().timestamp()),
+    );
+
+    Ok(())
 }
 
 /// Change the treasury address that receives collected performance fees.
