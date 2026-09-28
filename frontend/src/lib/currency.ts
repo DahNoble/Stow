@@ -163,8 +163,7 @@ export function parseLocaleNumber(input: string, locale?: string): number {
   const parts = new Intl.NumberFormat(resolveLocale(locale)).formatToParts(
     1234.5,
   );
-  const groupSeparator =
-    parts.find((p) => p.type === "group")?.value ?? ",";
+  const groupSeparator = parts.find((p) => p.type === "group")?.value ?? ",";
   const decimalSeparator =
     parts.find((p) => p.type === "decimal")?.value ?? ".";
 
@@ -184,4 +183,34 @@ export function parseLocaleNumber(input: string, locale?: string): number {
   if (Number.isNaN(value)) return NaN;
 
   return isNegative && value > 0 ? -value : value;
+}
+
+/**
+ * Formats yield amounts (position value, harvest history, APR) using
+ * locale-aware number formatting to match the rest of the app's monetary
+ * value display.
+ *
+ * Use this for all yield UI surfaces to ensure consistent formatting
+ * across supported locales.
+ */
+export function formatYieldAmount(
+  value: number,
+  options?: { locale?: string; maximumFractionDigits?: number },
+): string {
+  const { locale, maximumFractionDigits = 7 } = options ?? {};
+  return formatNumber(value, { locale, maximumFractionDigits });
+}
+
+/**
+ * Formats APR (annual percentage rate) as a locale-aware percentage.
+ *
+ * Use this for all APR displays in yield-related UI.
+ */
+export function formatAPR(
+  value: number,
+  options?: { locale?: string; maximumFractionDigits?: number },
+): string {
+  const { locale, maximumFractionDigits = 2 } = options ?? {};
+  const amount = formatNumber(value, { locale, maximumFractionDigits });
+  return `${amount}%`;
 }

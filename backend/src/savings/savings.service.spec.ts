@@ -3,10 +3,12 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { GoalsService } from '../goals/goals.service';
 import { BalanceService } from './balance.service';
 import { Group } from './entities/group.entity';
+import { YieldPosition } from './entities/yield-position.entity';
 import { SavingsService } from './savings.service';
 
 describe('SavingsService', () => {
   let service: SavingsService;
+  let yieldPositionRepository: { findOne: jest.Mock };
   let groupRepository: { createQueryBuilder: jest.Mock };
   let queryBuilder: {
     where: jest.Mock;
@@ -43,6 +45,10 @@ describe('SavingsService', () => {
       createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
     };
 
+    yieldPositionRepository = {
+      findOne: jest.fn(),
+    };
+
     balanceService = {
       get: jest.fn(),
     };
@@ -57,6 +63,10 @@ describe('SavingsService', () => {
         {
           provide: getRepositoryToken(Group),
           useValue: groupRepository,
+        },
+        {
+          provide: getRepositoryToken(YieldPosition),
+          useValue: yieldPositionRepository,
         },
         {
           provide: BalanceService,
@@ -259,6 +269,108 @@ describe('SavingsService', () => {
 
       expect(balanceService.get).toHaveBeenCalledWith(ADDRESS);
       expect(goalsService.summary).toHaveBeenCalledWith(ADDRESS);
+    });
+  });
+
+  describe('getYieldPosition', () => {
+    it('returns well-formed empty response when no position exists', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue(null);
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result).toEqual({
+        address: ADDRESS,
+        shares: '0',
+        estimated_asset_value: null,
+        exchange_rate_snapshot: null,
+        pending_withdrawal_claimable_at: null,
+        updated_at: expect.any(Date),
+      });
+    });
+
+    it('returns shares and exchange rate when position exists', async () => {
+      const now = new Date();
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '1000000000',
+        exchange_rate_snapshot: '1.25',
+        updated_at: now,
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.address).toBe(ADDRESS);
+      expect(result.shares).toBe('1000000000');
+      expect(result.exchange_rate_snapshot).toBe('1.25');
+      expect(result.updated_at).toBe(now);
+    });
+
+    it('calculates estimated asset value from shares and exchange rate', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '1000000', // 1M shares
+        exchange_rate_snapshot: '2.5', // 1 share = 2.5 assets
+        updated_at: new Date(),
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.estimated_asset_value).toBe('2500000'); // 1M * 2.5 = 2.5M
+    });
+
+    it('handles zero shares gracefully', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '0',
+        exchange_rate_snapshot: '1.0',
+        updated_at: new Date(),
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.shares).toBe('0');
+      expect(result.estimated_asset_value).toBeNull();
+    });
+
+    it('returns null exchange rate when not set', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '1000000000',
+        exchange_rate_snapshot: null,
+        updated_at: new Date(),
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.exchange_rate_snapshot).toBeNull();
+      expect(result.estimated_asset_value).toBeNull();
+    });
+
+    it('does not throw on invalid exchange rate calculation', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '1000000000',
+        exchange_rate_snapshot: 'invalid', // Will fail parseFloat
+        updated_at: new Date(),
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.estimated_asset_value).toBeNull();
+      expect(result.exchange_rate_snapshot).toBe('invalid');
+    });
+
+    it('returns pending_withdrawal_claimable_at as null (for future indexer integration)', async () => {
+      yieldPositionRepository.findOne.mockResolvedValue({
+        owner: ADDRESS,
+        shares: '1000000000',
+        exchange_rate_snapshot: '1.0',
+        updated_at: new Date(),
+      });
+
+      const result = await service.getYieldPosition(ADDRESS);
+
+      expect(result.pending_withdrawal_claimable_at).toBeNull();
     });
   });
 });

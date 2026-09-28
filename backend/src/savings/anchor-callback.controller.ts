@@ -6,6 +6,8 @@ import {
   HttpCode,
   HttpStatus,
   Logger,
+  UsePipes,
+  ValidationPipe,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { Public } from '../common/decorators/public.decorator';
@@ -17,6 +19,13 @@ import { AnchorService } from './anchor.service';
 @Controller('savings/anchor/callbacks')
 @Public()
 @UseGuards(WebhookSignatureGuard)
+@UsePipes(
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+  }),
+)
 export class AnchorCallbackController {
   private readonly logger = new Logger(AnchorCallbackController.name);
 

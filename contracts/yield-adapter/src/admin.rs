@@ -3,6 +3,7 @@
 use soroban_sdk::{Address, BytesN, Env};
 
 use crate::error::Error;
+use crate::events::{EVENT_SCHEMA_VERSION, TOPIC_INIT, TOPIC_PAUSED_CHANGED};
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::DataKey;
 
@@ -17,30 +18,58 @@ use crate::types::DataKey;
 /// Acceptance: after init, `admin()`, `treasury()`, and `token()` return the
 /// given values; `total_assets()` and `total_shares()` both return `0`.
 ///
-/// TODO(issue): implement — see `savings-vault::admin::initialize` for the
-/// reference shape (init-guard check, instance writes, event).
 pub fn initialize(
-    _env: &Env,
-    _admin: Address,
-    _treasury: Address,
-    _token: Address,
+    env: &Env,
+    admin: Address,
+    treasury: Address,
+    token: Address,
 ) -> Result<(), Error> {
-    unimplemented!("admin: initialize")
+    if env.storage().instance().has(&DataKey::Admin) {
+        return Err(Error::AlreadyInitialized);
+    }
+
+    extend_instance_ttl(env);
+
+    env.storage().instance().set(&DataKey::Admin, &admin);
+    env.storage().instance().set(&DataKey::Treasury, &treasury);
+    storage::set_token(env, &token);
+
+    env.storage()
+        .instance()
+        .set(&DataKey::NextStrategyId, &0u64);
+    env.storage()
+        .instance()
+        .set(&DataKey::NextWithdrawId, &0u64);
+    env.storage().instance().set(&DataKey::TotalShares, &0i128);
+    env.storage().instance().set(&DataKey::FeesAccrued, &0i128);
+
+    env.events().publish(
+        (TOPIC_INIT,),
+        (
+            admin,
+            treasury,
+            token,
+            EVENT_SCHEMA_VERSION,
+            env.ledger().timestamp(),
+        ),
+    );
+
+    Ok(())
 }
 
 /// Return the configured admin address, or `Error::NotInitialized`.
-pub fn admin(_env: &Env) -> Result<Address, Error> {
-    unimplemented!("admin: admin")
+pub fn admin(env: &Env) -> Result<Address, Error> {
+    storage::get_admin(env).ok_or(Error::NotInitialized)
 }
 
 /// Return the configured treasury address, or `Error::NotInitialized`.
-pub fn treasury(_env: &Env) -> Result<Address, Error> {
-    unimplemented!("admin: treasury")
+pub fn treasury(env: &Env) -> Result<Address, Error> {
+    storage::get_treasury(env).ok_or(Error::NotInitialized)
 }
 
 /// Return the configured vault token, or `Error::NotInitialized`.
-pub fn token(_env: &Env) -> Result<Address, Error> {
-    unimplemented!("admin: token")
+pub fn token(env: &Env) -> Result<Address, Error> {
+    storage::get_token(env).ok_or(Error::NotInitialized)
 }
 
 /// Rotate the admin. Requires `require_auth` from the current admin.
@@ -79,10 +108,19 @@ pub fn performance_fee_bps(env: &Env) -> u32 {
 ///   `fees` module doc for why this cap exists.
 /// - Takes effect on the *next* `harvest` call; does not retroactively
 ///   apply to yield already reported.
-///
-/// TODO(issue): implement.
-pub fn set_performance_fee_bps(_env: &Env, _caller: Address, _bps: u32) -> Result<(), Error> {
-    unimplemented!("admin: set_performance_fee_bps")
+pub fn set_performance_fee_bps(env: &Env, caller: Address, bps: u32) -> Result<(), Error> {
+    caller.require_auth();
+    let current_admin = admin(env)?;
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+    crate::fees::validate_fee_bps(bps)?;
+
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::PerformanceFeeBps, &bps);
+    Ok(())
 }
 
 /// Minimum number of seconds between successful `harvest` calls. Defaults
@@ -120,22 +158,33 @@ pub fn set_harvest_interval(env: &Env, caller: Address, seconds: u64) -> Result<
 /// While paused, `deposit`, `request_withdraw`, `harvest`, and strategy
 /// mutations reject with `Error::Paused`; `claim_withdraw` and reads remain
 /// available so users already mid-withdrawal are never trapped by a pause.
-///
-/// TODO(issue): implement — mirrors `savings-vault::admin::set_paused`, but
-/// note the narrower blocklist above (deliberately different from
-/// `savings-vault`, which pauses all mutations).
-pub fn set_paused(_env: &Env, _caller: Address, _paused: bool) -> Result<(), Error> {
-    unimplemented!("admin: set_paused")
+pub fn set_paused(env: &Env, caller: Address, paused: bool) -> Result<(), Error> {
+    caller.require_auth();
+    let current_admin = admin(env)?;
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+    extend_instance_ttl(env);
+    env.storage().instance().set(&DataKey::Paused, &paused);
+    env.events()
+        .publish((TOPIC_PAUSED_CHANGED,), (paused, env.ledger().timestamp()));
+    Ok(())
 }
 
 /// Whether the contract is currently paused. Defaults to `false` if unset.
-pub fn is_paused(_env: &Env) -> bool {
-    unimplemented!("admin: is_paused")
+pub fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
 /// Guard for mutating entrypoints: returns `Error::Paused` while paused.
-pub fn require_not_paused(_env: &Env) -> Result<(), Error> {
-    unimplemented!("admin: require_not_paused")
+pub fn require_not_paused(env: &Env) -> Result<(), Error> {
+    if is_paused(env) {
+        return Err(Error::Paused);
+    }
+    Ok(())
 }
 
 /// Cooldown, in seconds, `request_withdraw` must wait before

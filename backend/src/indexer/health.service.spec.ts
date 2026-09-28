@@ -48,6 +48,8 @@ describe('IndexerHealthService', () => {
       events_per_second: 1.5,
       lag_in_ledgers: 10,
       total_events_processed: 950,
+      deposits_processed: 25,
+      withdrawals_processed: 12,
       pending_events: 5,
       failed_events: 2,
       dlq_events: 1,
@@ -77,6 +79,8 @@ describe('IndexerHealthService', () => {
       events_per_second: 0,
       lag_in_ledgers: 150,
       total_events_processed: 100,
+      deposits_processed: 0,
+      withdrawals_processed: 0,
       pending_events: 0,
       failed_events: 0,
       dlq_events: 0,
@@ -124,6 +128,8 @@ describe('IndexerHealthService', () => {
     expect(output).toContain('indexer_lag_in_ledgers 10');
     expect(output).toContain('# TYPE indexer_is_running gauge');
     expect(output).toContain('indexer_total_events_processed 950');
+    expect(output).toContain('savings_deposits_processed_total 25');
+    expect(output).toContain('savings_withdrawals_processed_total 12');
   });
 
   it('triggers manual sync via indexer service', async () => {

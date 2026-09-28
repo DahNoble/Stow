@@ -11,6 +11,12 @@ export class IndexerMetricsDto {
   total_events_processed: number;
 
   @ApiProperty()
+  deposits_processed: number;
+
+  @ApiProperty()
+  withdrawals_processed: number;
+
+  @ApiProperty()
   pending_events: number;
 
   @ApiProperty()

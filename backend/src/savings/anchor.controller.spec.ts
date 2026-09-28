@@ -97,7 +97,11 @@ describe('AnchorController', () => {
       };
       anchorService.getQuote.mockResolvedValue(quote);
 
-      const result = await controller.getQuote('iso4217:NGN', 'stellar:USDC:GA5Z', '10000');
+      const result = await controller.getQuote({
+        sell_asset: 'iso4217:NGN',
+        buy_asset: 'stellar:USDC:GA5Z',
+        sell_amount: '10000',
+      });
 
       expect(anchorService.getQuote).toHaveBeenCalledWith(
         'iso4217:NGN',
@@ -114,7 +118,11 @@ describe('AnchorController', () => {
       );
 
       await expect(
-        controller.getQuote('iso4217:NGN', 'stellar:USDC:GA5Z', '10000'),
+        controller.getQuote({
+          sell_asset: 'iso4217:NGN',
+          buy_asset: 'stellar:USDC:GA5Z',
+          sell_amount: '10000',
+        }),
       ).rejects.toThrow(BadGatewayException);
     });
   });

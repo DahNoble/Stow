@@ -51,6 +51,31 @@ OpenAPI JSON: `http://localhost:3000/api/v1/docs-json`
 
 ---
 
+## Local Dev with Docker
+
+For a one-command setup with no local Node/pnpm/Postgres install, run:
+
+```bash
+docker compose up
+```
+
+This builds the API image and starts it alongside a Postgres 16 container, using the
+default local-dev values baked into `docker-compose.yml` (no `.env` file needed). Once
+both containers report healthy, the API is up at `http://localhost:3000/api/v1` and
+Swagger UI at `http://localhost:3000/api/v1/docs`.
+
+Run in the background with `docker compose up -d`, and tear it down (including the
+Postgres volume) with `docker compose down -v`.
+
+Database migrations are not run automatically. After the containers are up, apply them
+from the host with:
+
+```bash
+DATABASE_URL=postgresql://stow:stow@localhost:5432/stow pnpm run migration:run
+```
+
+---
+
 ## Environment Variables
 
 | Variable              | Description                       |

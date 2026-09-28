@@ -60,6 +60,14 @@ export class NotificationPreference {
   @Column({ type: 'varchar', length: 11, nullable: true })
   quietHours: string | null;
 
+  /**
+   * Whether the user wants to receive yield-earned notifications when a
+   * harvest credits them yield. Opt-in/opt-out is independent of other
+   * savings notifications. Defaults to false (opt-in).
+   */
+  @Column({ type: 'boolean', default: false })
+  yieldEarnedEnabled: boolean;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 

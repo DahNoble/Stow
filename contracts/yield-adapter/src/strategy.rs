@@ -9,8 +9,44 @@
 
 use soroban_sdk::{Address, Env, String, Vec};
 
+use crate::admin;
 use crate::error::Error;
-use crate::types::StrategyInfo;
+use crate::events::{
+    TOPIC_STRATEGY_CHANGED, TOPIC_STRATEGY_DEREGISTERED, TOPIC_STRATEGY_REGISTERED,
+};
+use crate::storage::{self, extend_instance_ttl, extend_persistent_ttl};
+use crate::types::{DataKey, StrategyInfo};
+
+fn require_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+    caller.require_auth();
+    let current_admin = admin::admin(env)?;
+    if *caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+/// True if `address` is already registered under any strategy id (active or
+/// not, deregistered or not — an id is permanent once allocated).
+fn is_address_registered(env: &Env, address: &Address) -> bool {
+    let next: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextStrategyId)
+        .unwrap_or(0);
+    for id in 1..=next {
+        if let Some(info) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StrategyInfo>(&DataKey::Strategy(id))
+        {
+            if info.address == *address {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Register a new strategy. Admin-only.
 ///
@@ -21,15 +57,39 @@ use crate::types::StrategyInfo;
 ///   separately. This split lets an admin register and sanity-check a
 ///   strategy before routing real funds to it.
 /// - Emits a `strategy_registered` event.
-///
-/// TODO(issue): implement.
 pub fn register_strategy(
-    _env: &Env,
-    _caller: Address,
-    _address: Address,
-    _name: String,
+    env: &Env,
+    caller: Address,
+    address: Address,
+    name: String,
 ) -> Result<u64, Error> {
-    unimplemented!("strategy: register_strategy")
+    require_admin(env, &caller)?;
+    admin::require_not_paused(env)?;
+
+    if is_address_registered(env, &address) {
+        return Err(Error::StrategyAlreadyRegistered);
+    }
+
+    extend_instance_ttl(env);
+    let id = storage::next_id(env, DataKey::NextStrategyId);
+    let info = StrategyInfo {
+        id,
+        address: address.clone(),
+        name,
+        deposit_cap: 0,
+        registered_at: env.ledger().timestamp(),
+        deregistered_at: None,
+    };
+    let key = DataKey::Strategy(id);
+    env.storage().persistent().set(&key, &info);
+    extend_persistent_ttl(env, &key);
+
+    env.events().publish(
+        (TOPIC_STRATEGY_REGISTERED,),
+        (id, address, env.ledger().timestamp()),
+    );
+
+    Ok(id)
 }
 
 /// Deregister a strategy. Admin-only.
@@ -40,10 +100,33 @@ pub fn register_strategy(
 /// - A deregistered strategy's id can never be re-registered or reactivated;
 ///   `deregistered_at` is permanent.
 /// - Emits a `strategy_deregistered` event.
-///
-/// TODO(issue): implement.
-pub fn deregister_strategy(_env: &Env, _caller: Address, _strategy_id: u64) -> Result<(), Error> {
-    unimplemented!("strategy: deregister_strategy")
+pub fn deregister_strategy(env: &Env, caller: Address, strategy_id: u64) -> Result<(), Error> {
+    require_admin(env, &caller)?;
+    admin::require_not_paused(env)?;
+
+    let active: Option<u64> = env.storage().instance().get(&DataKey::ActiveStrategy);
+    if active == Some(strategy_id) {
+        return Err(Error::StrategyActive);
+    }
+
+    let key = DataKey::Strategy(strategy_id);
+    let mut info: StrategyInfo = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::StrategyNotFound)?;
+
+    extend_instance_ttl(env);
+    info.deregistered_at = Some(env.ledger().timestamp());
+    env.storage().persistent().set(&key, &info);
+    extend_persistent_ttl(env, &key);
+
+    env.events().publish(
+        (TOPIC_STRATEGY_DEREGISTERED,),
+        (strategy_id, env.ledger().timestamp()),
+    );
+
+    Ok(())
 }
 
 /// Set the active strategy when there is currently none (first activation
@@ -55,10 +138,35 @@ pub fn deregister_strategy(_env: &Env, _caller: Address, _strategy_id: u64) -> R
 ///   — use `migrate_strategy` to switch between two active strategies so
 ///   funds are moved atomically rather than stranded.
 /// - Emits a `strategy_changed` event with `from: None`.
-///
-/// TODO(issue): implement.
-pub fn set_active_strategy(_env: &Env, _caller: Address, _strategy_id: u64) -> Result<(), Error> {
-    unimplemented!("strategy: set_active_strategy")
+pub fn set_active_strategy(env: &Env, caller: Address, strategy_id: u64) -> Result<(), Error> {
+    require_admin(env, &caller)?;
+    admin::require_not_paused(env)?;
+
+    if env.storage().instance().has(&DataKey::ActiveStrategy) {
+        return Err(Error::StrategyAlreadyActive);
+    }
+
+    let info: StrategyInfo = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Strategy(strategy_id))
+        .ok_or(Error::StrategyNotFound)?;
+    if info.deregistered_at.is_some() {
+        return Err(Error::StrategyNotFound);
+    }
+
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::ActiveStrategy, &strategy_id);
+
+    let from: Option<u64> = None;
+    env.events().publish(
+        (TOPIC_STRATEGY_CHANGED,),
+        (from, strategy_id, env.ledger().timestamp()),
+    );
+
+    Ok(())
 }
 
 /// Move all deployed funds from the current active strategy to
@@ -67,14 +175,80 @@ pub fn set_active_strategy(_env: &Env, _caller: Address, _strategy_id: u64) -> R
 /// - Requires `require_auth` from the current admin.
 /// - Withdraws the adapter's full balance from the old strategy, deposits it
 ///   into the new one.
-/// - Must preserve `total_assets()` (module the old strategy's own
+/// - Must preserve `total_assets()` (modulo the old strategy's own
 ///   withdrawal fees/slippage, if any — see the "Strategy interface" doc for
 ///   how those are surfaced and accounted for).
 /// - Emits a `strategy_changed` event with both `from` and `to` ids.
-///
-/// TODO(issue): implement.
-pub fn migrate_strategy(_env: &Env, _caller: Address, _new_strategy_id: u64) -> Result<(), Error> {
-    unimplemented!("strategy: migrate_strategy")
+pub fn migrate_strategy(env: &Env, caller: Address, new_strategy_id: u64) -> Result<(), Error> {
+    require_admin(env, &caller)?;
+    admin::require_not_paused(env)?;
+
+    let old_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::ActiveStrategy)
+        .ok_or(Error::StrategyNotFound)?;
+    if old_id == new_strategy_id {
+        return Err(Error::StrategyAlreadyActive);
+    }
+
+    let new_info: StrategyInfo = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Strategy(new_strategy_id))
+        .ok_or(Error::StrategyNotFound)?;
+    if new_info.deregistered_at.is_some() {
+        return Err(Error::StrategyNotFound);
+    }
+    let old_info: StrategyInfo = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Strategy(old_id))
+        .ok_or(Error::StrategyNotFound)?;
+
+    let contract_address = env.current_contract_address();
+
+    // Pull the adapter's full balance out of the old strategy, back into
+    // this contract, then push it all into the new one. The strategy
+    // interface's balance()/withdraw()/deposit() shapes are documented in
+    // README.md's "Strategy interface" section.
+    let deployed: i128 = env.invoke_contract(
+        &old_info.address,
+        &soroban_sdk::Symbol::new(env, "balance"),
+        soroban_sdk::vec![env, soroban_sdk::IntoVal::into_val(&contract_address, env)],
+    );
+    if deployed > 0 {
+        let () = env.invoke_contract(
+            &old_info.address,
+            &soroban_sdk::Symbol::new(env, "withdraw"),
+            soroban_sdk::vec![
+                env,
+                soroban_sdk::IntoVal::into_val(&contract_address, env),
+                soroban_sdk::IntoVal::into_val(&deployed, env)
+            ],
+        );
+        let () = env.invoke_contract(
+            &new_info.address,
+            &soroban_sdk::Symbol::new(env, "deposit"),
+            soroban_sdk::vec![
+                env,
+                soroban_sdk::IntoVal::into_val(&contract_address, env),
+                soroban_sdk::IntoVal::into_val(&deployed, env)
+            ],
+        );
+    }
+
+    extend_instance_ttl(env);
+    env.storage()
+        .instance()
+        .set(&DataKey::ActiveStrategy, &new_strategy_id);
+
+    env.events().publish(
+        (TOPIC_STRATEGY_CHANGED,),
+        (Some(old_id), new_strategy_id, env.ledger().timestamp()),
+    );
+
+    Ok(())
 }
 
 /// Set a per-strategy deposit cap, in vault-token stroops. `0` means
@@ -95,18 +269,38 @@ pub fn set_strategy_deposit_cap(
 }
 
 /// Read a strategy by id, or `Error::StrategyNotFound`.
-///
-/// TODO(issue): implement.
-pub fn get_strategy(_env: &Env, _strategy_id: u64) -> Result<StrategyInfo, Error> {
-    unimplemented!("strategy: get_strategy")
+pub fn get_strategy(env: &Env, strategy_id: u64) -> Result<StrategyInfo, Error> {
+    let key = DataKey::Strategy(strategy_id);
+    let info: StrategyInfo = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::StrategyNotFound)?;
+    extend_persistent_ttl(env, &key);
+    Ok(info)
 }
 
 /// List all registered strategies (including deregistered ones — check
 /// `deregistered_at` to filter).
 ///
-/// TODO(issue): implement. Note: iterates `1..=NextStrategyId`; fine at
-/// expected strategy counts (low single digits) but do not reuse this
-/// pattern for anything with unbounded cardinality (e.g. positions).
-pub fn list_strategies(_env: &Env) -> Vec<StrategyInfo> {
-    unimplemented!("strategy: list_strategies")
+/// Iterates `1..=NextStrategyId`; fine at expected strategy counts (low
+/// single digits) but do not reuse this pattern for anything with unbounded
+/// cardinality (e.g. positions).
+pub fn list_strategies(env: &Env) -> Vec<StrategyInfo> {
+    let next: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextStrategyId)
+        .unwrap_or(0);
+    let mut out = Vec::new(env);
+    for id in 1..=next {
+        if let Some(info) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StrategyInfo>(&DataKey::Strategy(id))
+        {
+            out.push_back(info);
+        }
+    }
+    out
 }

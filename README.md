@@ -412,3 +412,8 @@ See our detailed [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards (Rust/S
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
+
+## Handsoff notes
+
+<!-- handsoff-issue-302 -->
+- #302: [Frontend] — Yield settings in preferences page

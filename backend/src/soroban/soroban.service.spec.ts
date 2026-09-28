@@ -6,7 +6,11 @@ import {
   StrKey,
   SorobanDataBuilder,
 } from '@stellar/stellar-sdk';
-import { SorobanService } from './soroban.service';
+import {
+  SorobanService,
+  computeRpcBackoffDelay,
+  isTransientRpcError,
+} from './soroban.service';
 
 describe('SorobanService', () => {
   let service: SorobanService;
@@ -109,7 +113,7 @@ describe('SorobanService', () => {
         sequenceNumber: () => '1',
         accountId: () => testServerKeypair.publicKey(),
         incrementSequenceNumber: () => {},
-      } as never);
+      });
 
       jest
         .spyOn(SorobanRpc.Server.prototype, 'simulateTransaction')
@@ -149,7 +153,7 @@ describe('SorobanService', () => {
         sequenceNumber: () => '1',
         accountId: () => testServerKeypair.publicKey(),
         incrementSequenceNumber: () => {},
-      } as never);
+      });
 
       jest
         .spyOn(SorobanRpc.Server.prototype, 'simulateTransaction')
@@ -172,7 +176,7 @@ describe('SorobanService', () => {
         sequenceNumber: () => '1',
         accountId: () => testServerKeypair.publicKey(),
         incrementSequenceNumber: () => {},
-      } as never);
+      });
 
       jest
         .spyOn(SorobanRpc.Server.prototype, 'simulateTransaction')
@@ -196,6 +200,171 @@ describe('SorobanService', () => {
       await expect(
         service.resolveMarket(testMarketId, testOutcome),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('isTransientRpcError', () => {
+    it('classifies network-level TypeErrors as transient', () => {
+      expect(isTransientRpcError(new TypeError('fetch failed'))).toBe(true);
+    });
+
+    it('classifies AbortError as transient', () => {
+      const error = new Error('The operation was aborted');
+      error.name = 'AbortError';
+      expect(isTransientRpcError(error)).toBe(true);
+    });
+
+    it('classifies errno-coded causes as transient', () => {
+      const error = new Error('request failed');
+      (error as { cause?: unknown }).cause = { code: 'ECONNRESET' };
+      expect(isTransientRpcError(error)).toBe(true);
+    });
+
+    it('classifies HTTP 5xx as transient', () => {
+      expect(isTransientRpcError(new Error('HTTP 503'))).toBe(true);
+    });
+
+    it('classifies HTTP 429 as transient', () => {
+      expect(isTransientRpcError(new Error('HTTP 429'))).toBe(true);
+    });
+
+    it('classifies HTTP 4xx (non-429) as permanent', () => {
+      expect(isTransientRpcError(new Error('HTTP 400'))).toBe(false);
+    });
+
+    it('classifies non-Error values as permanent', () => {
+      expect(isTransientRpcError('some string')).toBe(false);
+    });
+
+    it('classifies unrelated errors (e.g. contract logic) as permanent', () => {
+      expect(isTransientRpcError(new Error('InsufficientFunds'))).toBe(false);
+    });
+  });
+
+  describe('computeRpcBackoffDelay', () => {
+    it('grows exponentially with the attempt index, within jitter bounds', () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const delay = computeRpcBackoffDelay(500, attempt);
+        const exact = 500 * Math.pow(4, attempt);
+        expect(delay).toBeGreaterThanOrEqual(Math.floor(exact * 0.8));
+        expect(delay).toBeLessThanOrEqual(Math.ceil(exact * 1.2));
+      }
+    });
+
+    it('never returns a negative delay', () => {
+      const delay = computeRpcBackoffDelay(1, 0);
+      expect(delay).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('retry/backoff on RPC calls', () => {
+    beforeEach(() => {
+      // Speed up retry-driven tests: no real waiting between attempts.
+      jest.spyOn(global, 'setTimeout').mockImplementation((fn: () => void) => {
+        fn();
+        return 0 as unknown as NodeJS.Timeout;
+      });
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('recovers from a transient testConnection failure and reports healthy', async () => {
+      jest
+        .spyOn(SorobanRpc.Server.prototype, 'getHealth')
+        .mockRejectedValueOnce(new TypeError('fetch failed'))
+        .mockResolvedValueOnce({ status: 'healthy' } as never);
+
+      await expect(service.testConnection()).resolves.toBe(true);
+      expect(service.isRpcHealthy()).toBe(true);
+      expect(service.getConsecutiveRpcFailures()).toBe(0);
+    });
+
+    it('marks the service unhealthy after persistent testConnection failures', async () => {
+      jest
+        .spyOn(SorobanRpc.Server.prototype, 'getHealth')
+        .mockRejectedValue(new TypeError('fetch failed'));
+
+      // Each testConnection() call exhausts SOROBAN_RPC_MAX_RETRIES (default 3)
+      // attempts and, on final failure, increments the consecutive-failure
+      // counter once. Three calls cross RPC_UNHEALTHY_FAILURE_THRESHOLD (3).
+      await expect(service.testConnection()).rejects.toThrow('fetch failed');
+      await expect(service.testConnection()).rejects.toThrow('fetch failed');
+      expect(service.isRpcHealthy()).toBe(true); // still below threshold
+
+      await expect(service.testConnection()).rejects.toThrow('fetch failed');
+      expect(service.isRpcHealthy()).toBe(false);
+      expect(service.getConsecutiveRpcFailures()).toBe(3);
+
+      expect(SorobanRpc.Server.prototype.getHealth).toHaveBeenCalledTimes(9); // 3 calls * 3 attempts
+    });
+
+    it('does not retry a permanent (non-transient) testConnection failure', async () => {
+      jest
+        .spyOn(SorobanRpc.Server.prototype, 'getHealth')
+        .mockRejectedValue(new Error('HTTP 400'));
+
+      await expect(service.testConnection()).rejects.toThrow('HTTP 400');
+      expect(SorobanRpc.Server.prototype.getHealth).toHaveBeenCalledTimes(1);
+      // Permanent errors don't count toward the RPC-connectivity outage signal.
+      expect(service.getConsecutiveRpcFailures()).toBe(0);
+      expect(service.isRpcHealthy()).toBe(true);
+    });
+
+    it('recovers after a transient getEvents HTTP failure without losing events', async () => {
+      let callCount = 0;
+      jest.spyOn(global, 'fetch').mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return { ok: false, status: 503 } as unknown as Response;
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            result: {
+              events: [
+                {
+                  id: 'evt-1',
+                  ledger: 100,
+                  topic: ['deposit'],
+                  value: { amount: '1000' },
+                },
+              ],
+              latestLedger: 100,
+            },
+          }),
+        } as unknown as Response;
+      });
+
+      const result = await service.getEvents(1);
+
+      expect(result.events).toHaveLength(1);
+      expect(result.events[0].id).toBe('evt-1');
+      expect(result.latestLedger).toBe(100);
+      expect(callCount).toBe(2);
+    });
+
+    it('exhausts retries on a persistent getEvents failure and returns partial results safely', async () => {
+      jest
+        .spyOn(global, 'fetch')
+        .mockResolvedValue({ ok: false, status: 500 } as unknown as Response);
+
+      const result = await service.getEvents(1);
+
+      // Safe-exit: no events collected, but the call resolves rather than
+      // throwing, and the caller keeps its last-known checkpoint.
+      expect(result.events).toEqual([]);
+      expect(result.latestLedger).toBe(1);
+      expect(service.getConsecutiveRpcFailures()).toBe(1);
+
+      // A single failed poll isn't a persistent outage yet — it takes
+      // RPC_UNHEALTHY_FAILURE_THRESHOLD (3) consecutive failures.
+      expect(service.isRpcHealthy()).toBe(true);
+
+      await service.getEvents(1);
+      await service.getEvents(1);
+      expect(service.isRpcHealthy()).toBe(false);
     });
   });
 });

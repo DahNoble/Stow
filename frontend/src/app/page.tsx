@@ -1,3 +1,5 @@
+"use client";
+
 import {
   ShieldCheck,
   Unlock,
@@ -24,6 +26,7 @@ import Navbar from "@/components/Navbar";
 import GithubIcon from "@/components/GithubIcon";
 import WaitlistForm from "@/components/WaitlistForm";
 import Logo from "@/components/Logo";
+import { useReveal } from "@/hooks/useReveal";
 
 const coreFeatures = [
   {
@@ -225,6 +228,10 @@ function SectionHeading({
 }
 
 export default function Home() {
+  const { ref: featuresRevealRef, revealed: featuresRevealed } = useReveal<HTMLDivElement>();
+  const { ref: productsRevealRef, revealed: productsRevealed } = useReveal<HTMLDivElement>();
+  const { ref: roadmapRevealRef, revealed: roadmapRevealed } = useReveal<HTMLDivElement>();
+
   return (
     <>
       <Navbar />
@@ -295,7 +302,10 @@ export default function Home() {
 
         {/* ================= FEATURES ================= */}
         <section id="features" className="px-5 py-24 sm:px-8">
-          <div className="mx-auto max-w-7xl">
+          <div
+            ref={featuresRevealRef}
+            className={`mx-auto max-w-7xl ${featuresRevealed ? "animate-rise" : "opacity-0"}`}
+          >
             <SectionHeading
               eyebrow="Core Features"
               title="Save on your terms, verified by code"
@@ -320,7 +330,10 @@ export default function Home() {
 
         {/* ================= PRODUCTS ================= */}
         <section id="products" className="px-5 py-24 sm:px-8">
-          <div className="mx-auto max-w-7xl">
+          <div
+            ref={productsRevealRef}
+            className={`mx-auto max-w-7xl ${productsRevealed ? "animate-rise" : "opacity-0"}`}
+          >
             <SectionHeading
               eyebrow="Savings Products"
               title="Five ways to save, one protocol"
@@ -476,7 +489,10 @@ export default function Home() {
 
         {/* ================= ROADMAP ================= */}
         <section id="roadmap" className="px-5 py-24 sm:px-8">
-          <div className="mx-auto max-w-7xl">
+          <div
+            ref={roadmapRevealRef}
+            className={`mx-auto max-w-7xl ${roadmapRevealed ? "animate-rise" : "opacity-0"}`}
+          >
             <SectionHeading
               eyebrow="Roadmap"
               title="Where Stow is headed"

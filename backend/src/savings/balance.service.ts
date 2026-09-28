@@ -17,8 +17,31 @@ export interface AccountBalanceView {
   updated_at: Date;
 }
 
+/** A single harvest observation used to derive the trailing-window APR. */
+export interface HarvestRecord {
+  /** Exchange rate (scaled integer, as a string) observed at `timestamp`. */
+  rate: string;
+  /** When the harvest was recorded. */
+  timestamp: Date;
+}
+
+/** Response shape for `GET /savings/yield/rate`. */
+export interface YieldRateView {
+  /** Current exchange rate (scaled integer, as a string). */
+  rate: string;
+  /** Trailing-window APR as a decimal fraction (e.g. `0.05` = 5%), or `null` when it cannot be derived. */
+  apr: number | null;
+  /** Length of the trailing window, in days, used for the APR. */
+  window_days: number;
+}
+
 /** TTL for balance reads: 10 seconds */
 const BALANCE_CACHE_TTL_MS = 10_000;
+
+/** Trailing window (in days) over which the APR is computed. */
+export const APR_WINDOW_DAYS = 30;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 const cacheKey = (account: string) => `savings:balance:${account}`;
 
@@ -100,6 +123,64 @@ export class BalanceService {
       amount: balance.amount,
       created_at: balance.created_at,
       updated_at: balance.updated_at,
+    };
+  }
+
+  /**
+   * Derives the trailing-window APR from a harvest history.
+   *
+   * The exchange rate grows monotonically as yield accrues, so the APR is
+   * the annualised simple growth rate between the oldest harvest inside the
+   * trailing window and the most recent one:
+   *
+   *   apr = (latestRate / oldestRate - 1) * (365 / elapsedDays)
+   *
+   * Returns `null` when the APR cannot be derived — fewer than two harvests,
+   * a non-positive/zero oldest rate, or a non-positive elapsed time.
+   */
+  computeApr(
+    history: HarvestRecord[],
+    windowDays: number = APR_WINDOW_DAYS,
+    now: Date = new Date(),
+  ): number | null {
+    if (!history || history.length < 2) return null;
+
+    const windowStart = now.getTime() - windowDays * MS_PER_DAY;
+    const inWindow = history
+      .filter((h) => h.timestamp.getTime() >= windowStart)
+      .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+    if (inWindow.length < 2) return null;
+
+    const oldest = inWindow[0];
+    const latest = inWindow[inWindow.length - 1];
+
+    const oldestRate = BigInt(oldest.rate);
+    const latestRate = BigInt(latest.rate);
+    if (oldestRate <= 0n) return null;
+
+    const elapsedMs = latest.timestamp.getTime() - oldest.timestamp.getTime();
+    if (elapsedMs <= 0) return null;
+
+    const elapsedDays = elapsedMs / MS_PER_DAY;
+    const growth = Number(latestRate) / Number(oldestRate) - 1;
+    return growth * (365 / elapsedDays);
+  }
+
+  /**
+   * Builds the `GET /savings/yield/rate` view: the current exchange rate
+   * plus the trailing-window APR derived from `history`.
+   */
+  buildYieldRateView(
+    currentRate: string,
+    history: HarvestRecord[],
+    windowDays: number = APR_WINDOW_DAYS,
+    now: Date = new Date(),
+  ): YieldRateView {
+    return {
+      rate: currentRate,
+      apr: this.computeApr(history, windowDays, now),
+      window_days: windowDays,
     };
   }
 }

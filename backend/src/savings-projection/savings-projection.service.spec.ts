@@ -269,4 +269,43 @@ describe('SavingsProjectionService', () => {
       expect(groupsService.markSettled).not.toHaveBeenCalled();
     });
   });
+
+  describe('strategy_changed', () => {
+    it('decodes first activation (from: null, to: strategy_id)', async () => {
+      const logSpy = jest.spyOn(service['logger'], 'log');
+
+      await service.apply('strategy_changed', {
+        from: null,
+        to: '42',
+      });
+
+      expect(logSpy).toHaveBeenCalledWith(
+        'Strategy activation: strategy_id=42',
+      );
+    });
+
+    it('decodes migration (from: strategy_id, to: strategy_id)', async () => {
+      const logSpy = jest.spyOn(service['logger'], 'log');
+
+      await service.apply('strategy_changed', {
+        from: '10',
+        to: '20',
+      });
+
+      expect(logSpy).toHaveBeenCalledWith('Strategy migration: from=10 to=20');
+    });
+
+    it('decodes emergency clear (from: strategy_id, to: null)', async () => {
+      const logSpy = jest.spyOn(service['logger'], 'log');
+
+      await service.apply('strategy_changed', {
+        from: '15',
+        to: null,
+      });
+
+      expect(logSpy).toHaveBeenCalledWith(
+        'Strategy emergency clear: cleared strategy_id=15',
+      );
+    });
+  });
 });

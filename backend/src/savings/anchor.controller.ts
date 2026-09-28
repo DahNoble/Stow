@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Post, Query, UsePipes, ValidationPipe } from '@nestjs/common';
 import { ApiBody, ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -6,9 +6,17 @@ import { ThrottleTier } from '../common/decorators/throttle-tier.decorator';
 import { User } from '../users/entities/user.entity';
 import { AnchorService } from './anchor.service';
 import { InitiateDepositDto } from './dto/initiate-deposit.dto';
+import { Sep38QuoteQueryDto } from './dto/sep38-quote-query.dto';
 
 @ApiTags('savings')
 @Controller('savings/anchor')
+@UsePipes(
+  new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+  }),
+)
 export class AnchorController {
   constructor(private readonly anchorService: AnchorService) {}
 
@@ -50,11 +58,11 @@ export class AnchorController {
   @ApiQuery({ name: 'sell_amount', example: '10000' })
   @ApiResponse({ status: 200, description: 'Quote returned (may be cached)' })
   @ApiResponse({ status: 502, description: 'Anchor unavailable' })
-  getQuote(
-    @Query('sell_asset') sellAsset: string,
-    @Query('buy_asset') buyAsset: string,
-    @Query('sell_amount') sellAmount: string,
-  ) {
-    return this.anchorService.getQuote(sellAsset, buyAsset, sellAmount);
+  getQuote(@Query() query: Sep38QuoteQueryDto) {
+    return this.anchorService.getQuote(
+      query.sell_asset,
+      query.buy_asset,
+      query.sell_amount,
+    );
   }
 }

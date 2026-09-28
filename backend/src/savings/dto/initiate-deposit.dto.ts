@@ -1,5 +1,6 @@
-import { IsNotEmpty, IsString } from 'class-validator';
+import { IsNotEmpty, IsString, Matches } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { STELLAR_ACCOUNT_ADDRESS_PATTERN } from './stellar-address.dto';
 
 export class InitiateDepositDto {
   /** Asset code to deposit (e.g. "USDC") */
@@ -12,5 +13,8 @@ export class InitiateDepositDto {
   @ApiProperty({ example: 'GSTELLAR...', description: 'Stellar account address' })
   @IsString()
   @IsNotEmpty()
+  @Matches(STELLAR_ACCOUNT_ADDRESS_PATTERN, {
+    message: 'account must be a valid Stellar account address',
+  })
   account: string;
 }

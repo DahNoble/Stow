@@ -3,8 +3,11 @@
 
 use soroban_sdk::{Address, Env};
 
+use crate::accounting;
 use crate::error::Error;
-use crate::types::WithdrawRequest;
+use crate::events::TOPIC_WITHDRAW_CANCELLED;
+use crate::storage;
+use crate::types::{DataKey, Position, WithdrawRequest};
 
 /// Burn `shares` from `owner`'s position and queue a withdrawal, claimable
 /// after `admin::withdraw_cooldown()` seconds.
@@ -54,10 +57,60 @@ pub fn claim_withdraw(_env: &Env, _owner: Address, _request_id: u64) -> Result<i
 /// - Errors `Error::WithdrawAlreadyResolved` if already claimed or
 ///   cancelled.
 /// - Emits a `withdraw_cancelled` event.
-///
-/// TODO(issue): implement.
-pub fn cancel_withdraw(_env: &Env, _owner: Address, _request_id: u64) -> Result<(), Error> {
-    unimplemented!("withdraw: cancel_withdraw")
+pub fn cancel_withdraw(env: &Env, owner: Address, request_id: u64) -> Result<(), Error> {
+    owner.require_auth();
+
+    let request_key = DataKey::WithdrawRequest(request_id);
+    let mut request: WithdrawRequest = env
+        .storage()
+        .persistent()
+        .get(&request_key)
+        .ok_or(Error::NotFound)?;
+    storage::extend_persistent_ttl(env, &request_key);
+
+    if owner != request.owner {
+        return Err(Error::Unauthorized);
+    }
+
+    if request.claimed_at.is_some() || request.cancelled_at.is_some() {
+        return Err(Error::WithdrawAlreadyResolved);
+    }
+
+    // The shares behind this request were burned at request time; re-mint
+    // at the *current* exchange rate against the asset amount fixed back
+    // then (not the share count that was burned then) — see this
+    // function's doc comment.
+    let shares = accounting::convert_to_shares(env, request.shares)?;
+
+    let position_key = DataKey::Position(owner.clone());
+    let mut position: Position = env
+        .storage()
+        .persistent()
+        .get(&position_key)
+        .ok_or(Error::NotFound)?;
+    position.shares = position.shares.checked_add(shares).ok_or(Error::Overflow)?;
+    position.updated_at = env.ledger().timestamp();
+
+    let total_shares = accounting::total_shares(env);
+    let new_total_shares = total_shares.checked_add(shares).ok_or(Error::Overflow)?;
+
+    request.cancelled_at = Some(env.ledger().timestamp());
+
+    storage::extend_instance_ttl(env);
+    env.storage().persistent().set(&position_key, &position);
+    storage::extend_persistent_ttl(env, &position_key);
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalShares, &new_total_shares);
+    env.storage().persistent().set(&request_key, &request);
+    storage::extend_persistent_ttl(env, &request_key);
+
+    env.events().publish(
+        (TOPIC_WITHDRAW_CANCELLED,),
+        (request_id, owner, shares, env.ledger().timestamp()),
+    );
+
+    Ok(())
 }
 
 /// Read a withdrawal request by id, or `Error::NotFound`.

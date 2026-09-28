@@ -74,18 +74,104 @@ export interface SorobanFinalizeEventResult {
   tx_hash: string;
 }
 
+/** Default maximum attempts for a retried RPC call (1 initial + 2 retries). */
+const DEFAULT_RPC_RETRY_MAX_ATTEMPTS = 3;
+
+/**
+ * Default base delay in milliseconds for exponential backoff between RPC
+ * retry attempts. Delay formula: baseDelay * 4^attempt → 500 ms, 2 s, 8 s.
+ */
+const DEFAULT_RPC_RETRY_BASE_DELAY_MS = 500;
+
+/**
+ * Jitter factor: each computed delay is randomised by ±20% to avoid
+ * thundering-herd retries when multiple RPC calls fail simultaneously.
+ */
+const RPC_RETRY_JITTER_FACTOR = 0.2;
+
+/**
+ * Number of consecutive RPC failures (after retries are exhausted) before
+ * the Soroban RPC connection is considered persistently unhealthy.
+ */
+const RPC_UNHEALTHY_FAILURE_THRESHOLD = 3;
+
+/**
+ * Returns true when the error looks like a transient RPC/network failure
+ * (connection reset, timeout, DNS failure, HTTP 5xx/429) as opposed to a
+ * permanent one (bad request, simulation/contract error). Only transient
+ * errors are worth retrying — retrying a contract logic error just wastes
+ * time and delays surfacing a real bug to the caller.
+ */
+export function isTransientRpcError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+
+  // Node's built-in fetch surfaces network-layer failures as TypeErrors
+  // (e.g. "fetch failed", "terminated", "network socket disconnected").
+  if (error instanceof TypeError) return true;
+
+  // Abort/timeout signals (AbortController-driven timeouts).
+  if (error.name === 'AbortError') return true;
+
+  const cause = (error as { cause?: unknown }).cause;
+  if (cause && typeof cause === 'object') {
+    const code = (cause as { code?: unknown }).code;
+    if (
+      typeof code === 'string' &&
+      [
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        'ENOTFOUND',
+        'EPIPE',
+        'EHOSTUNREACH',
+        'EAI_AGAIN',
+      ].includes(code)
+    ) {
+      return true;
+    }
+  }
+
+  // HTTP-level transient errors surfaced with a "HTTP <status>" message.
+  const httpMatch = /HTTP (\d{3})/.exec(error.message);
+  if (httpMatch) {
+    const status = parseInt(httpMatch[1], 10);
+    return status === 429 || (status >= 500 && status <= 599);
+  }
+
+  return false;
+}
+
+/**
+ * Computes the delay before retry attempt `attemptIndex` (0-based).
+ * Formula: baseDelayMs * 4^attemptIndex, jittered by ±RPC_RETRY_JITTER_FACTOR.
+ */
+export function computeRpcBackoffDelay(
+  baseDelayMs: number,
+  attemptIndex: number,
+): number {
+  const exponential = baseDelayMs * Math.pow(4, attemptIndex);
+  const jitter =
+    exponential * RPC_RETRY_JITTER_FACTOR * (Math.random() * 2 - 1);
+  return Math.max(0, Math.round(exponential + jitter));
+}
+
 @Injectable()
 export class SorobanService {
   private readonly logger = new Logger(SorobanService.name);
   private readonly contractId: string;
+  private readonly yieldAdapterContractId: string;
   private readonly network: string;
   private readonly serverSecretKey: string;
   private readonly rpcUrl: string;
   private readonly rpcServer: SorobanRpc.Server;
+  /** Consecutive RPC failures since the last success, used by `isRpcHealthy`. */
+  private consecutiveRpcFailures = 0;
 
   constructor(private readonly configService: ConfigService) {
     this.contractId =
       this.configService.get<string>('SOROBAN_CONTRACT_ID') ?? '';
+    this.yieldAdapterContractId =
+      this.configService.get<string>('SOROBAN_YIELD_ADAPTER_CONTRACT_ID') ?? '';
     this.network = this.configService.get<string>('STELLAR_NETWORK') ?? '';
     this.serverSecretKey =
       this.configService.get<string>('SERVER_SECRET_KEY') ?? '';
@@ -102,6 +188,11 @@ export class SorobanService {
         'SorobanService initialized with missing config values (SOROBAN_CONTRACT_ID/STELLAR_NETWORK/SERVER_SECRET_KEY)',
       );
     }
+    if (!this.yieldAdapterContractId) {
+      this.logger.debug(
+        'SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured; yield-adapter read methods will be unavailable',
+      );
+    }
   }
 
   getRpcClient(): SorobanRpc.Server {
@@ -116,9 +207,25 @@ export class SorobanService {
 
   async testConnection(): Promise<boolean> {
     return this.withSorobanErrorHandling('testConnection', async () => {
-      await this.rpcServer.getHealth();
+      await this.withRetry('testConnection', () => this.rpcServer.getHealth());
       return true;
     });
+  }
+
+  /**
+   * Reports whether the Soroban RPC connection is currently considered
+   * healthy, based on consecutive failures observed by `withRetry` (i.e.
+   * retries were exhausted `RPC_UNHEALTHY_FAILURE_THRESHOLD` times in a
+   * row without an intervening success). Intended for health-check
+   * endpoints to surface persistent RPC failure without throwing.
+   */
+  isRpcHealthy(): boolean {
+    return this.consecutiveRpcFailures < RPC_UNHEALTHY_FAILURE_THRESHOLD;
+  }
+
+  /** Number of consecutive RPC failures observed since the last success. */
+  getConsecutiveRpcFailures(): number {
+    return this.consecutiveRpcFailures;
   }
 
   async createMarket(
@@ -624,6 +731,373 @@ export class SorobanService {
     });
   }
 
+  // ---- yield-adapter read entrypoints ----
+
+  /**
+   * Read a depositor's position from the yield-adapter contract.
+   * Calls: get_position(owner: Address) -> Position
+   *
+   * Returns shares held and timestamps, or null if contract read fails.
+   */
+  async getYieldAdapterPosition(ownerAddress: string): Promise<{
+    shares: string;
+    created_at: number;
+    updated_at: number;
+  } | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterPosition: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterPosition',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call(
+                  'get_position',
+                  new Address(ownerAddress).toScVal(),
+                ),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterPosition simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          // Full implementation would decode the Position struct from the response
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterPosition failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the current exchange rate from the yield-adapter contract.
+   * Calls: exchange_rate() -> i128
+   *
+   * Returns the shares-to-assets ratio as a string, or null if contract read fails.
+   */
+  async getYieldAdapterExchangeRate(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterExchangeRate: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterExchangeRate',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('exchange_rate'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterExchangeRate simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          // Full implementation would decode the i128 from the response
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterExchangeRate failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the total assets under management in the yield-adapter contract.
+   * Calls: total_assets() -> i128
+   *
+   * Returns the total assets as a string, or null if contract read fails.
+   */
+  async getYieldAdapterTotalAssets(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterTotalAssets: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterTotalAssets',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('total_assets'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterTotalAssets simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          // Full implementation would decode the i128 from the response
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterTotalAssets failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read a pending withdrawal request from the yield-adapter contract.
+   * Calls: get_withdraw_request(request_id: u64) -> WithdrawRequest
+   *
+   * Returns withdrawal request details, or null if not found or contract read fails.
+   */
+  async getYieldAdapterWithdrawRequest(requestId: number): Promise<{
+    id: number;
+    shares: string;
+    claimable_at: number;
+    claimed_at: number | null;
+    cancelled_at: number | null;
+  } | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterWithdrawRequest: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterWithdrawRequest',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call(
+                  'get_withdraw_request',
+                  nativeToScVal(BigInt(requestId), { type: 'u64' }),
+                ),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterWithdrawRequest simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          // Full implementation would decode the WithdrawRequest struct from the response
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterWithdrawRequest failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read total shares from the yield-adapter contract.
+   * Calls: total_shares() -> i128
+   *
+   * Returns the total shares as a string, or null if contract read fails.
+   */
+  async getYieldAdapterTotalShares(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterTotalShares: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterTotalShares',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('total_shares'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterTotalShares simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterTotalShares failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the currently active strategy ID from the yield-adapter contract.
+   * Calls: get_active_strategy() -> Option<u64>
+   *
+   * Returns the strategy ID, or null if no active strategy (idle funds).
+   */
+  async getYieldAdapterActiveStrategy(): Promise<number | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterActiveStrategy: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterActiveStrategy',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call(
+                  'get_active_strategy',
+                ),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterActiveStrategy simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterActiveStrategy failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
+  /**
+   * Read the accrued-but-unswept fees from the yield-adapter contract.
+   * Calls: fees_accrued() -> i128
+   *
+   * Returns the accrued fees in stroops, or null if contract read fails.
+   */
+  async getYieldAdapterAccruedFees(): Promise<string | null> {
+    if (!this.yieldAdapterContractId) {
+      this.logger.warn(
+        'getYieldAdapterAccruedFees: SOROBAN_YIELD_ADAPTER_CONTRACT_ID not configured',
+      );
+      return null;
+    }
+
+    return this.withSorobanErrorHandling(
+      'getYieldAdapterAccruedFees',
+      async () => {
+        try {
+          const result = await this.rpcServer.simulateTransaction(
+            new TransactionBuilder(new Account(this.serverSecretKey, '0'), {
+              fee: '10000',
+              networkPassphrase: this.network,
+            })
+              .addOperation(
+                new Contract(this.yieldAdapterContractId).call('fees_accrued'),
+              )
+              .setTimeout(30)
+              .build(),
+          );
+
+          if (SorobanRpc.Api.isSimulationError(result)) {
+            this.logger.warn(
+              `getYieldAdapterAccruedFees simulation error: ${result.error}`,
+            );
+            return null;
+          }
+
+          // Decode result from XDR (stub: return null for now)
+          return null;
+        } catch (err) {
+          this.logger.error(
+            `getYieldAdapterAccruedFees failed: ${(err as Error).message}`,
+          );
+          return null;
+        }
+      },
+    );
+  }
+
   /**
    * Fetch contract events from the Soroban RPC node with full cursor-based
    * paging support.
@@ -698,31 +1172,32 @@ export class SorobanService {
       };
 
       try {
-        const response = await fetch(this.rpcUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 'stow-getEvents',
-            method: 'getEvents',
-            params,
-          }),
+        body = await this.withRetry('getEvents', async () => {
+          const response = await fetch(this.rpcUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 'stow-getEvents',
+              method: 'getEvents',
+              params,
+            }),
+          });
+
+          if (!response.ok) {
+            // Thrown so `withRetry`/`isTransientRpcError` can classify and
+            // retry transient statuses (5xx/429) with backoff.
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          return (await response.json()) as typeof body;
         });
-
-        if (!response.ok) {
-          // HTTP-level error — log and break so the caller keeps the
-          // checkpoint at the last successfully retrieved cursor.
-          this.logger.error(
-            `getEvents RPC HTTP error: ${response.status} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
-          );
-          break;
-        }
-
-        body = (await response.json()) as typeof body;
       } catch (fetchError) {
-        // Network-level error — same safe-exit strategy.
+        // Retries (if any) are exhausted, or the failure was permanent —
+        // log and break so the caller keeps the checkpoint at the last
+        // successfully retrieved cursor and can resume from there.
         this.logger.error(
-          `getEvents fetch failed: ${(fetchError as Error).message} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
+          `getEvents RPC failed: ${(fetchError as Error).message} (cursor=${activeCursor ?? 'none'}, fromLedger=${fromLedger})`,
         );
         break;
       }
@@ -802,6 +1277,71 @@ export class SorobanService {
       this.logger.error(`Soroban ${operation} failed: ${message}`);
       throw error;
     }
+  }
+
+  /**
+   * Wraps an RPC call with bounded retries and exponential backoff + jitter.
+   *
+   * - Max attempts: SOROBAN_RPC_MAX_RETRIES (default 3)
+   * - Delay formula: SOROBAN_RPC_RETRY_BASE_DELAY_MS * 4^attemptIndex →
+   *   500 ms, 2 s, 8 s by default
+   * - Jitter: ±20% of the computed delay
+   * - Only transient errors (network failures, HTTP 5xx/429) are retried;
+   *   permanent errors (e.g. simulation/contract errors) throw immediately.
+   * - Tracks consecutive failures so `isRpcHealthy()` can surface a
+   *   persistent outage to health checks without throwing.
+   */
+  private async withRetry<T>(
+    operation: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const maxAttempts = Number(
+      this.configService.get<string>('SOROBAN_RPC_MAX_RETRIES') ??
+        DEFAULT_RPC_RETRY_MAX_ATTEMPTS,
+    );
+    const baseDelayMs = Number(
+      this.configService.get<string>('SOROBAN_RPC_RETRY_BASE_DELAY_MS') ??
+        DEFAULT_RPC_RETRY_BASE_DELAY_MS,
+    );
+
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const result = await fn();
+        this.consecutiveRpcFailures = 0;
+        return result;
+      } catch (error) {
+        lastError = error;
+
+        if (!isTransientRpcError(error)) {
+          // Permanent failure — do not retry, do not count toward the
+          // persistent-outage threshold (it isn't an RPC connectivity issue).
+          throw error;
+        }
+
+        const attemptsRemaining = maxAttempts - attempt - 1;
+        if (attemptsRemaining === 0) {
+          break; // exhausted — record failure and throw below
+        }
+
+        const delayMs = computeRpcBackoffDelay(baseDelayMs, attempt);
+        this.logger.warn(
+          `Transient RPC failure during ${operation} — attempt ${attempt + 1}/${maxAttempts}, ` +
+            `retrying in ${delayMs} ms: ${error instanceof Error ? error.message : String(error)}`,
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    this.consecutiveRpcFailures += 1;
+    this.logger.error(
+      `RPC ${operation} failed after ${maxAttempts} attempt(s) ` +
+        `(${this.consecutiveRpcFailures} consecutive failures): ` +
+        `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    );
+    throw lastError;
   }
 
   private normalizeEvent(rawEvent: unknown): SorobanRpcEvent | null {

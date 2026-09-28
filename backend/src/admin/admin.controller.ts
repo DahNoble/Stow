@@ -23,6 +23,8 @@ import { ListUsersQueryDto } from './dto/list-users-query.dto';
 import { ListVerifiedAddressesQueryDto } from './dto/list-verified-addresses-query.dto';
 import { UpdateUserRoleDto } from './dto/update-user-role.dto';
 import { SavingsOverviewDto } from './dto/savings-overview.dto';
+import { YieldAdminOverviewResponseDto } from '../savings/dto/yield-admin-overview-response.dto';
+import { AdminAuditInterceptor } from './interceptors/admin-audit.interceptor';
 
 type RequestUser = Request & { user: { id: string } };
 
@@ -52,6 +54,7 @@ export class AdminController {
 
   @Get('savings/overview')
   @Roles(Role.Admin, Role.Moderator)
+  @UseInterceptors(AdminAuditInterceptor)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Aggregate savings metrics (deposits, accounts, status breakdown)' })
   @ApiResponse({
@@ -62,6 +65,21 @@ export class AdminController {
   @ApiResponse({ status: 403, description: 'Forbidden — admin or moderator role required' })
   async getSavingsOverview(): Promise<SavingsOverviewDto> {
     return this.adminService.getSavingsOverview();
+  }
+
+  @Get('savings/yield/overview')
+  @Roles(Role.Admin, Role.Moderator)
+  @UseInterceptors(AdminAuditInterceptor)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Aggregate yield-adapter metrics (strategy, assets, fees, harvest history)' })
+  @ApiResponse({
+    status: 200,
+    description: 'Yield adapter overview metrics',
+    type: YieldAdminOverviewResponseDto,
+  })
+  @ApiResponse({ status: 403, description: 'Forbidden — admin or moderator role required' })
+  async getYieldOverview(): Promise<YieldAdminOverviewResponseDto> {
+    return this.adminService.getYieldOverview();
   }
 
   @Patch('users/:id/ban')

@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stow
+      POSTGRES_PASSWORD: stow
+      POSTGRES_DB: stow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stow -d stow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://stow:stow@postgres:5432/stow
+      JWT_SECRET: local-dev-only-jwt-secret-min-32-characters
+      JWT_EXPIRES_IN: 7d
+      STELLAR_NETWORK: testnet
+      SOROBAN_CONTRACT_ID: CABC123456789DEFGHIJKLMNOPQRSTUVWXYZ123456789012345678
+      USDC_TOKEN_ADDRESS: CDEF123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789012345
+      SERVER_SECRET_KEY: local-dev-only-stellar-secret-key
+      PORT: 3000
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/v1/health/ping', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  postgres_data:

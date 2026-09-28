@@ -7,14 +7,26 @@ import { VerifiedAddress } from './entities/verified-address.entity';
 import { AnchorDeposit } from '../savings/entities/anchor-deposit.entity';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
+import { AdminAuditLog } from './entities/admin-audit-log.entity';
+import { AdminAuditInterceptor } from './interceptors/admin-audit.interceptor';
+import { ContractEvent } from '../indexer/entities/contract-event.entity';
+import { SorobanModule } from '../soroban/soroban.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, UserFlag, VerifiedAddress, AnchorDeposit]),
+    TypeOrmModule.forFeature([
+      User,
+      UserFlag,
+      VerifiedAddress,
+      AnchorDeposit,
+      AdminAuditLog,
+      ContractEvent,
+    ]),
     CacheModule.register(),
+    SorobanModule,
   ],
   controllers: [AdminController],
-  providers: [AdminService],
+  providers: [AdminService, AdminAuditInterceptor],
   exports: [AdminService],
 })
 export class AdminModule {}

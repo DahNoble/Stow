@@ -4,6 +4,7 @@ import { BalanceService } from '../savings/balance.service';
 import { GroupsService } from '../savings/groups.service';
 import { LockedPlansService } from '../savings/locked-plans.service';
 import { NotificationGeneratorService } from '../notifications/notification-generator.service';
+import { SavingsService } from '../savings/savings.service';
 
 /**
  * Applies a single savings-vault contract event to the off-chain
@@ -26,6 +27,7 @@ export class SavingsProjectionService {
     private readonly groupsService: GroupsService,
     private readonly lockedPlansService: LockedPlansService,
     private readonly notificationGeneratorService: NotificationGeneratorService,
+    private readonly savingsService: SavingsService,
   ) {}
 
   async apply(topic: string, data: Record<string, unknown>): Promise<void> {
@@ -94,6 +96,60 @@ export class SavingsProjectionService {
         break;
       }
 
+      case 'strategy_changed': {
+        // Decode yield-adapter strategy_changed event:
+        // - Activation: from is null, to is set
+        // - Migration: from and to are both set
+        // - Emergency clear: from is set, to is null
+        const from = data.from ? Number(data.from) : null;
+        const to = data.to ? Number(data.to) : null;
+
+        // Log for admin/ops historical tracking; no side effects needed
+        if (from === null && to !== null) {
+          this.logger.log(`Strategy activation: strategy_id=${to}`);
+        } else if (from !== null && to !== null) {
+          this.logger.log(`Strategy migration: from=${from} to=${to}`);
+        } else if (from !== null && to === null) {
+          this.logger.log(
+            `Strategy emergency clear: cleared strategy_id=${from}`,
+          );
+        }
+        break;
+      }
+
+      case 'deposited': {
+        // Handle yield-adapter deposited event per contracts/yield-adapter/README.md:
+        // Topics: (Symbol("deposited"), owner: Address)
+        // Data: [owner, amount, shares_minted, position_shares, total_shares, timestamp]
+        const owner = String(data.owner ?? '');
+        const shares = String(data.position_shares ?? data.total_shares ?? '0');
+        const exchangeRate = data.total_shares && data.total_assets
+          ? this.calculateExchangeRate(
+              String(data.total_assets),
+              String(data.total_shares),
+            )
+          : undefined;
+
+        if (owner && shares) {
+          await this.savingsService.upsertYieldPosition(owner, shares, exchangeRate);
+          this.logger.log(`Yield deposited: owner=${owner}, shares=${shares}`);
+        }
+        break;
+      }
+
+      case 'harvested': {
+        // Handle yield-adapter harvested event:
+        // Topics: (Symbol("harvested"),)
+        // Data: [caller, strategy_id, delta, fee, total_assets, total_shares, timestamp]
+        // The harvested event updates the exchange rate for all positions
+        // Invalidate the yield rate cache so the next request fetches fresh data
+        await this.savingsService.invalidateYieldRateCache();
+        this.logger.log(
+          `Yield harvested: strategy=${data.strategy_id}, delta=${data.delta}, fee=${data.fee} — cache invalidated`,
+        );
+        break;
+      }
+
       default:
         this.logger.debug(`No projection handler for topic "${topic}"`);
         break;
@@ -121,5 +177,22 @@ export class SavingsProjectionService {
     const seconds =
       typeof value === 'bigint' ? Number(value) : Number(value ?? 0);
     return new Date(seconds * 1000);
+  }
+
+  /**
+   * Calculates the exchange rate from total assets and total shares.
+   * Returns the rate as a scaled integer string (assets/shares * 1e7 for precision).
+   */
+  private calculateExchangeRate(totalAssets: string, totalShares: string): string {
+    try {
+      const assets = BigInt(totalAssets);
+      const shares = BigInt(totalShares);
+      if (shares === 0n) return '0';
+      // Calculate rate with 7 decimal places of precision
+      const rate = (assets * 10_000_000n) / shares;
+      return rate.toString();
+    } catch {
+      return '0';
+    }
   }
 }
