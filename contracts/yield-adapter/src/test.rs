@@ -415,6 +415,50 @@ fn cancel_withdraw_returns_shares_to_owner() {
 }
 
 #[test]
+fn get_withdraw_request_returns_seeded_request() {
+    use crate::types::{DataKey, WithdrawRequest};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, _token) = setup_with_token(&env);
+    let owner = Address::generate(&env);
+    let request_id = 1u64;
+    let now = env.ledger().timestamp();
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::WithdrawRequest(request_id),
+            &WithdrawRequest {
+                id: request_id,
+                owner: owner.clone(),
+                shares: 500,
+                claimable_at: now + 3600,
+                requested_at: now,
+                claimed_at: None,
+                cancelled_at: None,
+            },
+        );
+    });
+
+    let request = client.get_withdraw_request(&request_id);
+    assert_eq!(request.id, request_id);
+    assert_eq!(request.owner, owner);
+    assert_eq!(request.shares, 500);
+    assert_eq!(request.claimable_at, now + 3600);
+    assert!(request.claimed_at.is_none());
+    assert!(request.cancelled_at.is_none());
+}
+
+#[test]
+fn get_withdraw_request_not_found() {
+    let env = Env::default();
+    let (client, _admin, _treasury, _token) = setup_with_token(&env);
+
+    let result = client.try_get_withdraw_request(&999);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
 #[ignore = "TODO(issue): implement harvest::harvest — needs a mock strategy contract"]
 fn harvest_increases_exchange_rate_for_depositors() {
     todo!("deposit, simulate strategy yield, harvest, assert exchange_rate() increased");

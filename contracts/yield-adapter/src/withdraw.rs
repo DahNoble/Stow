@@ -114,8 +114,13 @@ pub fn cancel_withdraw(env: &Env, owner: Address, request_id: u64) -> Result<(),
 }
 
 /// Read a withdrawal request by id, or `Error::NotFound`.
-///
-/// TODO(issue): implement.
-pub fn get_withdraw_request(_env: &Env, _request_id: u64) -> Result<WithdrawRequest, Error> {
-    unimplemented!("withdraw: get_withdraw_request")
+pub fn get_withdraw_request(env: &Env, request_id: u64) -> Result<WithdrawRequest, Error> {
+    let key = DataKey::WithdrawRequest(request_id);
+    let request: WithdrawRequest = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
+    storage::extend_persistent_ttl(env, &key);
+    Ok(request)
 }
