@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
+import AprDisplaySkeleton from './AprDisplaySkeleton';
 
 const YIELD_RATE_ENDPOINT = '/savings/yield/rate';
 
 interface YieldRateResponse {
-  apr: number;
+  apr?: number;
+  rate?: number;
 }
 
 export interface AprDisplayProps {
@@ -46,7 +48,8 @@ export function AprDisplay({
         }
         const data = (await response.json()) as YieldRateResponse;
         if (!cancelled) {
-          setRate(data.apr);
+          const rawRate = data.rate !== undefined ? (data.rate <= 1 ? data.rate * 100 : data.rate) : data.apr;
+          setRate(rawRate);
           setError(false);
         }
       } catch {
@@ -81,7 +84,9 @@ export function AprDisplay({
         data-state="loading"
         aria-busy="true"
       >
-        APR: …
+        <span data-testid="apr-display-loading">
+          <AprDisplaySkeleton />
+        </span>
       </span>
     );
   }
@@ -89,14 +94,14 @@ export function AprDisplay({
   if (error || rate === undefined) {
     return (
       <span className={className} data-testid="apr-display" data-state="error">
-        APR: —
+        <span data-testid="apr-display-error">APR: —</span>
       </span>
     );
   }
 
   return (
     <span className={className} data-testid="apr-display" data-state="ready">
-      APR: {rate.toFixed(2)}%
+      <span data-testid="apr-display-value">APR: {rate.toFixed(2)}%</span>
     </span>
   );
 }

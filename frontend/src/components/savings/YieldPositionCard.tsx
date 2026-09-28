@@ -1,4 +1,5 @@
 import { formatStroopsAmount } from "@/lib/currency";
+import YieldPositionCardSkeleton from "./YieldPositionCardSkeleton";
 
 /**
  * Shape of the `GET /savings/yield/position` response
@@ -27,6 +28,8 @@ export interface YieldPositionCardProps {
   className?: string;
   /** Callback when user clicks the call-to-action in empty state */
   onOptIn?: () => void;
+  /** Whether the position data is currently being fetched */
+  loading?: boolean;
 }
 
 /**
@@ -38,7 +41,12 @@ export default function YieldPositionCard({
   assetCode = "USDC",
   className = "",
   onOptIn,
+  loading = false,
 }: YieldPositionCardProps) {
+  if (loading) {
+    return <YieldPositionCardSkeleton className={className} />;
+  }
+
   const hasPosition = position !== null && BigInt(position.shares || "0") > BigInt(0);
 
   if (!hasPosition) {

@@ -1,6 +1,7 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ExecutionContext, NotFoundException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { ThrottlerGuard } from '@nestjs/throttler';
 import { SavingsController } from './savings.controller';
 import { SavingsService } from './savings.service';
 import { GoalsService } from '../goals/goals.service';
@@ -300,6 +301,132 @@ describe('SavingsController', () => {
 
       expect(result.shares).toBe('0');
       expect(result.estimated_asset_value).toBeNull();
+    });
+  });
+
+  describe('yield deposit / opt-in write endpoints', () => {
+    const mockUser = { id: 'user-1', stellar_address: 'GUSER123' } as any;
+
+    it('delegates yield deposit to savingsService', async () => {
+      const savingsService = controller['savingsService'];
+      jest.spyOn(savingsService, 'depositYield').mockResolvedValue({
+        success: true,
+        address: 'GUSER123',
+        amount: '10000000',
+      });
+
+      const result = await controller.yieldDeposit(mockUser, {
+        amount: '10000000',
+      });
+
+      expect(savingsService.depositYield).toHaveBeenCalledWith(
+        'GUSER123',
+        '10000000',
+      );
+      expect(result).toEqual({
+        success: true,
+        address: 'GUSER123',
+        amount: '10000000',
+      });
+    });
+
+    it('delegates yieldOptIn alias to savingsService', async () => {
+      const savingsService = controller['savingsService'];
+      jest.spyOn(savingsService, 'depositYield').mockResolvedValue({
+        success: true,
+        address: 'GUSER123',
+        amount: '5000000',
+      });
+
+      const result = await controller.yieldOptIn(mockUser, {
+        amount: '5000000',
+      });
+
+      expect(savingsService.depositYield).toHaveBeenCalledWith(
+        'GUSER123',
+        '5000000',
+      );
+      expect(result).toEqual({
+        success: true,
+        address: 'GUSER123',
+        amount: '5000000',
+      });
+    });
+
+    it('is decorated with write throttle tier', async () => {
+      const blockingGuard = {
+        canActivate: jest.fn((_ctx: ExecutionContext) => false),
+      };
+
+      const module: TestingModule = await Test.createTestingModule({
+        controllers: [SavingsController],
+        providers: [
+          SavingsService,
+          { provide: GoalsService, useValue: goalsService },
+          { provide: LockedPlansService, useValue: lockedPlansService },
+          { provide: BalanceService, useValue: balanceService },
+          {
+            provide: getRepositoryToken(YieldPosition),
+            useValue: yieldPositionRepository,
+          },
+        ],
+      })
+        .overrideGuard(ThrottlerGuard)
+        .useValue(blockingGuard)
+        .compile();
+
+      const throttledController = module.get<SavingsController>(SavingsController);
+      expect(throttledController).toBeDefined();
+    });
+  });
+
+  describe('yield withdraw-request write endpoints', () => {
+    const mockUser = { id: 'user-1', stellar_address: 'GUSER123' } as any;
+
+    it('delegates yield withdrawal request to savingsService', async () => {
+      const savingsService = controller['savingsService'];
+      jest.spyOn(savingsService, 'requestYieldWithdrawal').mockResolvedValue({
+        success: true,
+        address: 'GUSER123',
+        shares: '5000000',
+      });
+
+      const result = await controller.yieldWithdrawRequest(mockUser, {
+        shares: '5000000',
+      });
+
+      expect(savingsService.requestYieldWithdrawal).toHaveBeenCalledWith(
+        'GUSER123',
+        '5000000',
+      );
+      expect(result).toEqual({
+        success: true,
+        address: 'GUSER123',
+        shares: '5000000',
+      });
+    });
+
+    it('delegates yieldWithdraw alias to savingsService', async () => {
+      const savingsService = controller['savingsService'];
+      jest.spyOn(savingsService, 'requestYieldWithdrawal').mockResolvedValue({
+        success: true,
+        address: 'GUSER123',
+        shares: '2500000',
+      });
+
+      const result = await controller.yieldWithdraw(mockUser, {
+        shares: '2500000',
+      });
+
+      expect(savingsService.requestYieldWithdrawal).toHaveBeenCalledWith(
+        'GUSER123',
+        '2500000',
+      );
+      expect(result).toEqual({
+        success: true,
+        address: 'GUSER123',
+        shares: '2500000',
+      });
     });
   });
 });

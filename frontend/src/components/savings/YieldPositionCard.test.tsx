@@ -80,4 +80,12 @@ describe("YieldPositionCard", () => {
     render(<YieldPositionCard position={position} onOptIn={onOptIn} />);
     expect(screen.queryByTestId("yield-position-cta")).not.toBeInTheDocument();
   });
+
+  it("renders YieldPositionCardSkeleton when loading is true", () => {
+    render(<YieldPositionCard position={position} loading={true} />);
+    expect(
+      screen.getByRole("status", { name: /loading yield position/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("yield-position-card-skeleton")).toBeInTheDocument();
+  });
 });

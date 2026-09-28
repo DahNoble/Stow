@@ -1,24 +1,30 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Get,
+  HttpCode,
+  HttpStatus,
   NotFoundException,
   Param,
+  Post,
   Query,
   UseGuards,
   UsePipes,
   ValidationPipe,
 } from '@nestjs/common';
 import {
+  ApiBearerAuth,
+  ApiBody,
   ApiOperation,
   ApiParam,
   ApiQuery,
   ApiResponse,
   ApiTags,
-  ApiBearerAuth,
 } from '@nestjs/swagger';
 import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { ThrottleTier } from '../common/decorators/throttle-tier.decorator';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { GoalsService } from '../goals/goals.service';
 import { BalanceService } from './balance.service';
@@ -29,6 +35,7 @@ import { SavingsSummaryDto } from './dto/savings-summary.dto';
 import { YieldPositionResponseDto } from './dto/yield-position-response.dto';
 import { YieldRateResponseDto } from './dto/yield-rate-response.dto';
 import { YieldAdminOverviewResponseDto } from './dto/yield-admin-overview-response.dto';
+import { YieldDepositDto, YieldWithdrawRequestDto } from './dto/yield-mutation.dto';
 import { SavingsAddressListQueryDto } from './dto/savings-list-query.dto';
 import { SavingsAddressParamDto } from './dto/stellar-address.dto';
 import { SavingsService } from './savings.service';
@@ -261,5 +268,97 @@ export class SavingsController {
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   async getYieldAdminOverview(): Promise<YieldAdminOverviewResponseDto> {
     return this.savingsService.getYieldAdminOverview();
+  }
+
+  /**
+   * POST /savings/yield/deposit
+   *
+   * Initiates / records a yield adapter deposit (opt-in).
+   * Rate limit: write tier — 30 requests / 60 s per user.
+   */
+  @Post('yield/deposit')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ThrottleTier('write')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Opt in / deposit into the yield adapter' })
+  @ApiBody({ type: YieldDepositDto })
+  @ApiResponse({ status: 200, description: 'Deposit processed' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 429, description: 'Too many requests (write tier)' })
+  async yieldDeposit(
+    @CurrentUser() user: User,
+    @Body() dto: YieldDepositDto,
+  ) {
+    return this.savingsService.depositYield(user.stellar_address, dto.amount);
+  }
+
+  /**
+   * POST /savings/yield/opt-in
+   *
+   * Alias for yield deposit (opt-in).
+   * Rate limit: write tier — 30 requests / 60 s per user.
+   */
+  @Post('yield/opt-in')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ThrottleTier('write')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Opt in / deposit into the yield adapter' })
+  @ApiBody({ type: YieldDepositDto })
+  @ApiResponse({ status: 200, description: 'Opt-in processed' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 429, description: 'Too many requests (write tier)' })
+  async yieldOptIn(
+    @CurrentUser() user: User,
+    @Body() dto: YieldDepositDto,
+  ) {
+    return this.savingsService.depositYield(user.stellar_address, dto.amount);
+  }
+
+  /**
+   * POST /savings/yield/withdraw-request
+   *
+   * Submits a withdrawal request from the yield adapter.
+   * Rate limit: write tier — 30 requests / 60 s per user.
+   */
+  @Post('yield/withdraw-request')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ThrottleTier('write')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Request withdrawal from yield adapter' })
+  @ApiBody({ type: YieldWithdrawRequestDto })
+  @ApiResponse({ status: 200, description: 'Withdrawal requested' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 429, description: 'Too many requests (write tier)' })
+  async yieldWithdrawRequest(
+    @CurrentUser() user: User,
+    @Body() dto: YieldWithdrawRequestDto,
+  ) {
+    return this.savingsService.requestYieldWithdrawal(user.stellar_address, dto.shares);
+  }
+
+  /**
+   * POST /savings/yield/withdraw
+   *
+   * Alias for withdrawal request from the yield adapter.
+   * Rate limit: write tier — 30 requests / 60 s per user.
+   */
+  @Post('yield/withdraw')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ThrottleTier('write')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Request withdrawal from yield adapter' })
+  @ApiBody({ type: YieldWithdrawRequestDto })
+  @ApiResponse({ status: 200, description: 'Withdrawal requested' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 429, description: 'Too many requests (write tier)' })
+  async yieldWithdraw(
+    @CurrentUser() user: User,
+    @Body() dto: YieldWithdrawRequestDto,
+  ) {
+    return this.savingsService.requestYieldWithdrawal(user.stellar_address, dto.shares);
   }
 }

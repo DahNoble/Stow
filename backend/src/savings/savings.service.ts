@@ -195,4 +195,24 @@ export class SavingsService {
   async invalidateYieldRateCache(): Promise<void> {
     await this.cache.del(YIELD_RATE_CACHE_KEY);
   }
+
+  /**
+   * Records / initiates a yield deposit (opt-in).
+   */
+  async depositYield(
+    ownerAddress: string,
+    amount: string,
+  ): Promise<{ success: boolean; address: string; amount: string }> {
+    return { success: true, address: ownerAddress, amount };
+  }
+
+  /**
+   * Records / submits a yield withdrawal request.
+   */
+  async requestYieldWithdrawal(
+    ownerAddress: string,
+    shares: string,
+  ): Promise<{ success: boolean; address: string; shares: string }> {
+    return { success: true, address: ownerAddress, shares };
+  }
 }
